@@ -7,6 +7,7 @@ Local-first hackathon MVP combining uploaded-video person detection with an expl
 - Python 3.10+ and Node.js/npm.
 - Existing project weights `yolov8n.pt` at the project root. The backend lazily loads this file and does not download another model.
 - Python packages from `requirements.txt`; frontend packages from `frontend/package.json`.
+- SQLite is created at `data/e_sentinel.db` by default. Set `ESENTINEL_DB_PATH` before backend startup to select another absolute path or project-root-relative path.
 
 From the project root, use two PowerShell terminals.
 
@@ -27,7 +28,7 @@ npm run dev
 
 Open the URL Vite prints (normally `http://localhost:5173`). The Vite `/api` proxy forwards requests to `http://127.0.0.1:8000`. API docs: `http://127.0.0.1:8000/docs`.
 
-If `.venv` does not exist, create it with `py -m venv .venv`, activate it, then run `pip install -r requirements.txt`. Use Python and package pins supported by the host if an existing pin is unavailable. No `.env` is required. There is no external map, LLM, email, or SMS provider configured, so no API credentials are needed for the demo.
+If `.venv` does not exist, create it with `py -m venv .venv`, activate it, then run `pip install -r requirements.txt`. Use Python and package pins supported by the host if an existing pin is unavailable. To select the database from PowerShell, set `$env:ESENTINEL_DB_PATH = 'data/e_sentinel.db'` before launching Uvicorn. No `.env` is required. There is no external map, LLM, email, or SMS provider configured, so no API credentials are needed for the demo.
 
 ## Complete demo
 
@@ -44,7 +45,8 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 ## Architecture
 
 - `backend/main.py`: FastAPI compatibility endpoints, video upload/inference, contact and monitoring routes.
-- `backend/event_engine.py`: in-memory timestamped event records, explainable configurable rules, simulated journey state, redaction, local assistant, test-only notifications.
+- `backend/event_engine.py`: timestamped event rules, simulated journey state, redaction, local assistant, test-only notifications.
+- `backend/database.py`: SQLite schema/repository with per-operation connections, WAL, busy timeout, and parameterized transactional writes.
 - `frontend/src/App.jsx`: dashboard, route illustration, cabin evidence, timeline, trusted contacts, and local assistant.
 - `frontend/vite.config.js`: local API proxy.
 - `vision/`: standalone experiments; `tests/test_backend.py`: API and event-rule tests.
@@ -58,6 +60,7 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 - `PUT /api/monitoring/config`: set route offset (50-10,000 m), stop duration (1-120 min), and check-in interval (5-720 min) thresholds.
 - `POST /api/monitoring/check-in`: record a simulated check-in.
 - `GET /api/events?limit=50`: list recent event records (limit 1-100).
+- `GET /api/alerts?limit=50`: list persisted medium/high/critical events.
 - `POST /api/events/demo`: create validated `route_deviation`, `unexpected_stop`, `missed_check_in`, `cabin_person_count_change`, or explicitly user-triggered `user_sos` events.
 - `DELETE /api/events/demo`: reset demo events and simulated check-in state.
 - `GET /api/incidents/summary`: generated in-memory event summary and severity counts.
@@ -74,7 +77,7 @@ Route offset and stop/check-in durations are user-triggered simulation inputs co
 ## Privacy, reliability, limitations
 
 - Uploaded video is processed by the local backend. The raw upload is written to an OS temporary file and deleted in request cleanup. The single annotated preview is encoded in memory and returned in the response; it is not retained. Avoid sensitive recordings without consent and authorization.
-- Events, contact destinations, configuration, and check-in state live only in backend memory; they disappear on process restart. Contact responses show masked destination hints. There is no authentication, production access control, persistent audit trail, or real alert provider.
+- Events, thresholds, cabin peak state, and simulated check-in state persist in SQLite. Trusted-contact destinations stay in memory only and disappear on backend restart; API responses show masked destination hints. There is no authentication, production access control, or real alert provider.
 - The map is not a map provider and displays no real coordinates. No GPS, routing, vehicle telemetry, or live check-in source is connected.
 - Local assistant answers from structured event history/rules. It does not call an LLM or give emergency guidance. No external credentials or `.env.example` are needed.
 - Notification test mode does not send email/SMS. The SOS demo does not notify contacts or emergency services. No automated detection can trigger SOS.
@@ -87,6 +90,12 @@ Route offset and stop/check-in durations are user-triggered simulation inputs co
 Push-Location frontend; npm run lint; Pop-Location
 Push-Location frontend; npm run build; Pop-Location
 ```
+
+## Database location and backup
+
+The default database file is `data/e_sentinel.db`. `ESENTINEL_DB_PATH` can point to an absolute path or a path relative to the project root. SQLite `-wal` and `-shm` sidecars can exist while the backend is running; database files and sidecars are ignored by Git. Stop the backend before making a simple file-copy backup; use SQLite's online backup API/tool for a live database so WAL data is included.
+
+This database belongs to one local development instance, not a production multi-user service. There is no authentication, encryption-at-rest configuration, managed backup process, or migration framework. Startup uses idempotent table creation and does not drop existing data. Raw video, frames, contacts, and credentials are not stored in SQLite.
 
 ## Troubleshooting
 

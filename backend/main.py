@@ -1,7 +1,8 @@
 
+import base64
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import os
-import base64
 from pathlib import Path
 import tempfile
 
@@ -9,6 +10,7 @@ import cv2
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from ultralytics import YOLO
 
+from backend.database import PersistenceError
 from backend.event_engine import (
     AssistantQuestion,
     ContactInput,
@@ -19,10 +21,18 @@ from backend.event_engine import (
     event_engine,
 )
 
+
+@asynccontextmanager
+async def lifespan(_app):
+    event_engine.initialize()
+    yield
+
+
 app = FastAPI(
     title="e-Sentinel AI",
     description="AI-assisted women's journey safety prototype",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -92,12 +102,26 @@ def safety_status():
 
 @app.get("/api/monitoring/state")
 def monitoring_state():
-    return event_engine.monitoring_state()
+    try:
+        return event_engine.monitoring_state()
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Persistent local storage is unavailable.") from exc
 
 
 @app.get("/api/events")
 def recent_events(limit: int = Query(default=50, ge=1, le=100)):
-    return {"events": event_engine.list_events(limit), "mode": "local_demo"}
+    try:
+        return {"events": event_engine.list_events(limit), "mode": "local_demo"}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Persistent local storage is unavailable.") from exc
+
+
+@app.get("/api/alerts")
+def recent_alerts(limit: int = Query(default=50, ge=1, le=100)):
+    try:
+        return {"alerts": event_engine.repository.list_alerts(limit), "mode": "local_demo"}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Persistent local storage is unavailable.") from exc
 
 
 @app.post("/api/events/demo")
@@ -106,26 +130,40 @@ def create_demo_event(request: DemoEventRequest):
         return event_engine.create_demo_event(request)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Event could not be saved.") from exc
 
 
 @app.delete("/api/events/demo")
 def reset_demo_events():
-    return event_engine.reset()
+    try:
+        return event_engine.reset()
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Demo data could not be reset.") from exc
 
 
 @app.put("/api/monitoring/config")
 def configure_monitoring(config: MonitoringConfig):
-    return event_engine.configure(config)
+    try:
+        return event_engine.configure(config)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Monitoring settings could not be saved.") from exc
 
 
 @app.get("/api/incidents/summary")
 def incident_summary():
-    return event_engine.summary()
+    try:
+        return event_engine.summary()
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Incident data is unavailable.") from exc
 
 
 @app.post("/api/assistant/query")
 def assistant_query(question: AssistantQuestion):
-    return event_engine.ask(question.question)
+    try:
+        return event_engine.ask(question.question)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Event data is unavailable to the assistant.") from exc
 
 
 @app.get("/api/contacts")
@@ -153,7 +191,10 @@ def add_trusted_contact(contact: ContactInput):
 
 @app.post("/api/monitoring/check-in")
 def simulate_check_in():
-    return event_engine.check_in()
+    try:
+        return event_engine.check_in()
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Check-in could not be saved.") from exc
 
 
 @app.post("/api/notifications/test")
@@ -321,6 +362,8 @@ def analyze_cabin(file: UploadFile = File(...)):
             ),
         }
 
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Cabin event could not be saved.") from exc
     except HTTPException:
         raise
     except Exception as exc:

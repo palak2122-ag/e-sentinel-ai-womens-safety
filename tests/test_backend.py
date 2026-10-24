@@ -1,11 +1,13 @@
 import unittest
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from backend import main
-from backend.event_engine import EventEngine
+from backend.database import PersistenceError, SQLiteRepository
+from backend.event_engine import EventEngine, MonitoringConfig
 
 
 class FakeCapture:
@@ -59,16 +61,32 @@ class FakeModel:
 
 class BackendApiTests(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        main.event_engine = EventEngine(
+            SQLiteRepository(f"{self.temp_dir.name}/test.db")
+        )
+        main.event_engine.initialize()
         main.event_engine.reset()
-        main.event_engine.configure(main.MonitoringConfig())
+        main.event_engine.configure(MonitoringConfig())
         main.event_engine.set_contacts([])
         self.client = TestClient(main.app)
+
+    def tearDown(self):
+        self.client.close()
+        self.temp_dir.cleanup()
 
     def test_health_endpoint_reports_healthy(self):
         response = self.client.get("/api/health")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "healthy")
+
+    def test_safety_status_contract_remains_unknown(self):
+        response = self.client.get("/api/safety-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["risk_level"], "UNKNOWN")
+        self.assertFalse(response.json()["monitoring_active"])
 
     def test_upload_rejects_unsupported_extension(self):
         response = self.client.post(
@@ -137,6 +155,18 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("500 m", event["rule"])
         self.assertTrue(event["is_demo"])
         self.assertIsNotNone(event["occurred_at"])
+        self.assertEqual(self.client.get("/api/events").json()["events"][0]["id"], event["id"])
+
+    def test_alert_api_reads_persisted_qualifying_events(self):
+        created = self.client.post(
+            "/api/events/demo",
+            json={"event_type": "user_sos"},
+        ).json()
+
+        response = self.client.get("/api/alerts")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["alerts"][0]["id"], created["id"])
 
     def test_demo_event_below_threshold_is_rejected(self):
         response = self.client.post(
@@ -218,6 +248,27 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertTrue(response.json()["events_cleared"])
         self.assertEqual(self.client.get("/api/events").json()["events"], [])
+
+    def test_demo_reset_preserves_non_demo_cabin_observation(self):
+        main.event_engine.record_cabin_peak(1)
+        main.event_engine.record_cabin_peak(3)
+
+        response = self.client.delete("/api/events/demo")
+
+        self.assertTrue(response.json()["non_demo_events_preserved"])
+        events = self.client.get("/api/events").json()["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "cabin_person_count_change")
+
+    def test_write_failure_returns_service_unavailable_without_success(self):
+        with patch.object(main.event_engine.repository, "save_event", side_effect=PersistenceError("private db path")):
+            response = self.client.post(
+                "/api/events/demo",
+                json={"event_type": "route_deviation", "route_deviation_meters": 700},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"detail": "Event could not be saved."})
 
     def test_simulated_check_in_updates_monitoring_state(self):
         response = self.client.post("/api/monitoring/check-in")

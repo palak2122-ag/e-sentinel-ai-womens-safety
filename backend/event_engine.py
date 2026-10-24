@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
-import base64
 from threading import RLock
 from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
+
+from backend.database import SQLiteRepository
 
 
 EventType = Literal[
@@ -51,22 +52,39 @@ class NotificationTestRequest(BaseModel):
 
 
 class EventEngine:
-    """Resettable local event service; no data is persisted between restarts."""
+    """Event rules and non-sensitive session state backed by SQLite."""
 
-    def __init__(self):
+    def __init__(self, repository: SQLiteRepository | None = None):
         self._lock = RLock()
+        self.repository = repository or SQLiteRepository()
         self.config = MonitoringConfig()
-        self.events: list[dict] = []
         self.contacts: list[dict] = []
         self.last_cabin_peak: int | None = None
         self.check_in_status = "simulated_pending"
         self.checked_in_at: str | None = None
 
+    def initialize(self) -> None:
+        self.repository.initialize()
+        config = self.repository.load_config()
+        check_in = self.repository.load_check_in()
+        last_peak = self.repository.load_last_cabin_peak()
+        with self._lock:
+            if config is not None:
+                self.config = MonitoringConfig.model_validate(config)
+            if check_in is not None:
+                self.check_in_status = check_in["status"]
+                self.checked_in_at = check_in["occurred_at"]
+            self.last_cabin_peak = last_peak
+
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def create_demo_event(self, request: DemoEventRequest) -> dict:
+    def create_demo_event(
+        self,
+        request: DemoEventRequest,
+        cabin_peak_to_save: int | None = None,
+    ) -> dict:
         event_type = request.event_type
         severity = "info"
         fact = ""
@@ -106,9 +124,6 @@ class EventEngine:
                 raise ValueError(f"Check-in is below the configured {threshold} min interval.")
             severity = "high" if minutes >= threshold * 2 else "medium"
             inference = "A simulated check-in is overdue; this does not establish that a person is unsafe."
-            with self._lock:
-                self.check_in_status = "simulated_overdue"
-                self.checked_in_at = None
         elif event_type == "cabin_person_count_change":
             previous = request.previous_count
             current = request.current_count
@@ -141,47 +156,65 @@ class EventEngine:
             "unknown": "Harassment, intent, identity, and personal safety are unknown.",
             "note": request.note,
         }
+        check_in_status = "simulated_overdue" if event_type == "missed_check_in" else None
+        if cabin_peak_to_save is not None:
+            self.repository.save_cabin_observation(event, cabin_peak_to_save)
+        else:
+            self.repository.save_event(event, check_in_status=check_in_status)
         with self._lock:
-            self.events.insert(0, event)
-            self.events = self.events[:200]
+            if check_in_status is not None:
+                self.check_in_status = check_in_status
+                self.checked_in_at = None
+            if cabin_peak_to_save is not None:
+                self.last_cabin_peak = cabin_peak_to_save
         return event
 
     def record_cabin_peak(self, current_count: int) -> dict | None:
         with self._lock:
             previous = self.last_cabin_peak
-            self.last_cabin_peak = current_count
         if previous is None or previous == current_count:
+            self.repository.save_cabin_observation(None, current_count)
+            with self._lock:
+                self.last_cabin_peak = current_count
             return None
         return self.create_demo_event(
             DemoEventRequest(
                 event_type="cabin_person_count_change",
                 previous_count=previous,
                 current_count=current_count,
-            )
+            ),
+            cabin_peak_to_save=current_count,
         )
 
     def list_events(self, limit: int = 50) -> list[dict]:
-        with self._lock:
-            return [dict(event) for event in self.events[:limit]]
+        return self.repository.list_events(limit)
 
     def reset(self) -> dict:
+        deleted = self.repository.reset_demo_state()
         with self._lock:
-            self.events.clear()
             self.last_cabin_peak = None
             self.check_in_status = "simulated_pending"
             self.checked_in_at = None
-        return {"status": "reset", "events_cleared": True, "demo_data_only": True}
+        return {
+            "status": "reset",
+            "events_cleared": True,
+            "deleted_demo_events": deleted,
+            "demo_data_only": True,
+            "non_demo_events_preserved": True,
+        }
 
     def configure(self, config: MonitoringConfig) -> dict:
+        self.repository.save_config(config.model_dump())
         with self._lock:
             self.config = config
         return self.monitoring_state()
 
     def monitoring_state(self) -> dict:
+        latest_events = self.repository.list_events(1)
         with self._lock:
-            recent = self.events[0] if self.events else None
+            recent = latest_events[0] if latest_events else None
             config = self.config.model_dump()
-            count = len(self.events)
+        count = len(self.repository.list_events(200))
         return {
             "monitoring_mode": "local_demo",
             "is_live_monitoring": False,
@@ -287,9 +320,11 @@ class EventEngine:
         return current[-1]
 
     def check_in(self) -> dict:
+        checked_in_at = self._now()
+        self.repository.save_check_in(checked_in_at, "simulated_checked_in")
         with self._lock:
             self.check_in_status = "simulated_checked_in"
-            self.checked_in_at = self._now()
+            self.checked_in_at = checked_in_at
         return {
             "check_in_status": self.check_in_status,
             "checked_in_at": self.checked_in_at,

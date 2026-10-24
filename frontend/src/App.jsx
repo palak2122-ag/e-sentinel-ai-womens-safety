@@ -23,6 +23,7 @@ export default function App() {
   const [journey, setJourney] = useState(null)
   const [thresholds, setThresholds] = useState(null)
   const [events, setEvents] = useState([])
+  const [eventsError, setEventsError] = useState('')
   const [contacts, setContacts] = useState([])
   const [contactForm, setContactForm] = useState({ name: '', channel: 'email', destination: '' })
   const [assistantQuestion, setAssistantQuestion] = useState('Summarize recent events')
@@ -42,10 +43,12 @@ export default function App() {
       setJourney(state)
       setThresholds((current) => current ?? state.configuration)
       setEvents(eventData.events)
+      setEventsError('')
       setContacts(contactData.contacts)
       setOnline(true)
-    } catch {
+    } catch (error) {
       setOnline(false)
+      setEventsError(error.message || 'Could not load saved events from the backend.')
     }
   }
 
@@ -409,7 +412,7 @@ export default function App() {
         <section className="columns lower-grid">
           <article className="panel" id="timeline">
             <div className="panel-title"><div><p className="eyebrow">AUDIT TRAIL</p><h2>Safety event timeline</h2></div><span className="tag">{events.length} EVENTS</span></div>
-            {events.length === 0 ? <div className="empty-state">No events yet. Cabin observations and simulated journey events will appear here.</div> : (
+            {eventsError ? <div className="error" role="alert">Saved events are unavailable: {eventsError}</div> : events.length === 0 ? <div className="empty-state">No events yet. Cabin observations and simulated journey events will appear here.</div> : (
               <ol className="timeline-list">
                 {events.slice(0, 12).map((event) => (
                   <li key={event.id} className="timeline-item">

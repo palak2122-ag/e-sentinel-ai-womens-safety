@@ -6,3 +6,6 @@ runs/
 *.pt
 .env
 .DS_Store
+data/*.db
+data/*.db-wal
+data/*.db-shm
