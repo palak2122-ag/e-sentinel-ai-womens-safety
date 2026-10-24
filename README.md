@@ -45,7 +45,8 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 ## Architecture
 
 - `backend/main.py`: FastAPI compatibility endpoints, video upload/inference, contact and monitoring routes.
-- `backend/event_engine.py`: timestamped event rules, simulated journey state, redaction, local assistant, test-only notifications.
+- `backend/event_engine.py`: timestamped journey event rules, simulated state, redaction, and local assistant.
+- `backend/risk_engine.py`: validated multi-signal scoring, unknown-data handling, escalation safeguards, cancellation, and mock notification provider.
 - `backend/database.py`: SQLite schema/repository with per-operation connections, WAL, busy timeout, and parameterized transactional writes.
 - `frontend/src/App.jsx`: dashboard, route illustration, cabin evidence, timeline, trusted contacts, and local assistant.
 - `frontend/vite.config.js`: local API proxy.
@@ -67,6 +68,26 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 - `POST /api/assistant/query`: summarize event history or explain the latest rule with the local rules assistant; no external LLM is called.
 - `GET /api/contacts`, `POST /api/contacts`, `PUT /api/contacts`: view redacted contacts, add one, or replace the list. Destinations exist in process memory only.
 - `POST /api/notifications/test`: exercise test mode. Always reports `delivery_confirmed: false` and `contact_notified: false`.
+- `POST /api/risk/assessments`: submit camera/GPS/vehicle/check-in observations and persist score, reasons, provenance, data quality, recommendation, and escalation state.
+- `GET /api/risk/assessments/latest` and `GET /api/risk/assessments?limit=50`: latest assessment and persisted history.
+- `PUT /api/risk/config`: configure scoring thresholds and escalation opt-in.
+- `GET /api/escalation/history?limit=50`: persisted state transitions and mock notification attempts.
+- `POST /api/escalation/process`: explicitly process a pending escalation through the mock provider.
+- `POST /api/escalation/cancel`: audit a user cancellation for a pending check-in/escalation.
+
+### Multi-signal risk engine
+
+This transparent rule-based score is a prototype, not a probability of harm, validated model, or certified vehicle safety system. Defaults: GPS deviation of at least 500 m adds 30 points; stop of at least 5 minutes adds 25; reported sudden braking adds 20; unanswered check-in at least 10 minutes overdue adds 35. A camera detection-count change adds at most 8 weak contextual points and is not proof of distress. Each active signal is weighted by reliability, then the sum is capped at 100. Bands: low 0-19, medium 20-44, high 45-69, critical 70-100.
+
+Missing/unknown sources, stale timestamps (default 300 seconds), reliability below 0.25, poor GPS accuracy, or future timestamps are excluded and reported as unknown. Approved route changes do not score. High risk asks for a discreet check-in. Critical risk requires at least two reliable corroborating signals and no more than two unknowns before it can enter `escalation_pending`; otherwise it remains check-in-required. Pending escalation can be cancelled before an explicit `POST /api/escalation/process` action. Escalation is disabled unless both `ESENTINEL_ESCALATION_ENABLED=true` and API policy configuration explicitly enable it. The only included provider is a network-isolated mock; its “delivered” status means simulated delivery, never a real contact notification. Unknown signals are never interpreted as evidence that a passenger is safe.
+
+Risk weights and thresholds are configurable with `PUT /api/risk/config`. To demonstrate the mock escalation path in a local session only:
+
+```powershell
+$env:ESENTINEL_ESCALATION_ENABLED = 'true'
+```
+
+This flag does not enable SMS, email, police, or emergency-service delivery. No real provider credentials are required or read.
 
 YOLO settings: `YOLO_CONFIDENCE` and `YOLO_IOU` default to `0.45`; `VIDEO_FRAME_STRIDE` defaults to `1`. Confidence/IoU must be 0-1; stride is at least 1. Higher stride reduces processing but can miss brief appearances.
 
@@ -78,8 +99,10 @@ Route offset and stop/check-in durations are user-triggered simulation inputs co
 
 - Uploaded video is processed by the local backend. The raw upload is written to an OS temporary file and deleted in request cleanup. The single annotated preview is encoded in memory and returned in the response; it is not retained. Avoid sensitive recordings without consent and authorization.
 - Events, thresholds, cabin peak state, and simulated check-in state persist in SQLite. Trusted-contact destinations stay in memory only and disappear on backend restart; API responses show masked destination hints. There is no authentication, production access control, or real alert provider.
+- Risk assessments, escalation transitions, mock notification attempts, and risk policy persist in SQLite. Real delivery is not implemented, and the risk-engine environment gate defaults off.
 - The map is not a map provider and displays no real coordinates. No GPS, routing, vehicle telemetry, or live check-in source is connected.
 - Local assistant answers from structured event history/rules. It does not call an LLM or give emergency guidance. No external credentials or `.env.example` are needed.
+- Camera person counts/keypoints cannot prove fear, harassment, assault, intent, identity, or safety. Missing camera data is unknown, not safe. The demo GPS/vehicle signals are explicitly simulated; no physical sensors are integrated.
 - Notification test mode does not send email/SMS. The SOS demo does not notify contacts or emergency services. No automated detection can trigger SOS.
 - Model errors and video codec differences can affect outputs. False positives and false negatives remain possible. `safety_assessment` remains unknown.
 

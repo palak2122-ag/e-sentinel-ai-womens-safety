@@ -24,6 +24,11 @@ export default function App() {
   const [thresholds, setThresholds] = useState(null)
   const [events, setEvents] = useState([])
   const [eventsError, setEventsError] = useState('')
+  const [riskAssessment, setRiskAssessment] = useState(null)
+  const [riskHistory, setRiskHistory] = useState([])
+  const [escalations, setEscalations] = useState([])
+  const [riskError, setRiskError] = useState('')
+  const [discreetMode, setDiscreetMode] = useState(false)
   const [contacts, setContacts] = useState([])
   const [contactForm, setContactForm] = useState({ name: '', channel: 'email', destination: '' })
   const [assistantQuestion, setAssistantQuestion] = useState('Summarize recent events')
@@ -35,20 +40,28 @@ export default function App() {
 
   async function refreshWorkspace() {
     try {
-      const [state, eventData, contactData] = await Promise.all([
+      const [state, eventData, contactData, latestRisk, riskData, escalationData] = await Promise.all([
         api('/api/monitoring/state'),
         api('/api/events?limit=30'),
         api('/api/contacts'),
+        api('/api/risk/assessments/latest'),
+        api('/api/risk/assessments?limit=10'),
+        api('/api/escalation/history?limit=20'),
       ])
       setJourney(state)
       setThresholds((current) => current ?? state.configuration)
       setEvents(eventData.events)
       setEventsError('')
       setContacts(contactData.contacts)
+      setRiskAssessment(latestRisk)
+      setRiskHistory(riskData.assessments)
+      setEscalations(escalationData.history)
+      setRiskError('')
       setOnline(true)
     } catch (error) {
       setOnline(false)
       setEventsError(error.message || 'Could not load saved events from the backend.')
+      setRiskError(error.message || 'Risk state is unavailable.')
     }
   }
 
@@ -177,6 +190,51 @@ export default function App() {
     })
   }
 
+  function simulateRiskScenario(scenario) {
+    const common = { demo_mode: true }
+    const scenarios = {
+      route: { ...common, gps: { source: 'simulated', deviation_meters: 900, accuracy_meters: 18, reliability: 0.9 } },
+      stop: { ...common, vehicle: { source: 'simulated', stopped_minutes: 12, ignition_on: true, reliability: 0.9 } },
+      combined: {
+        ...common,
+        gps: { source: 'simulated', deviation_meters: 1400, accuracy_meters: 15, reliability: 0.95 },
+        vehicle: { source: 'simulated', stopped_minutes: 18, sudden_braking: true, reliability: 0.9 },
+        check_in: { source: 'simulated', responded: false, overdue_minutes: 25, reliability: 0.9 },
+      },
+      unknown: { ...common, camera: { available: false, source: 'unknown' } },
+    }
+    runAction(`risk-${scenario}`, async () => {
+      const assessment = await api('/api/risk/assessments', { method: 'POST', body: JSON.stringify(scenarios[scenario]) })
+      setRiskAssessment(assessment)
+      await refreshWorkspace()
+      setNotificationMessage(`Simulated risk assessment: ${assessment.risk_level} (${assessment.risk_score}/100). No real contacts were notified.`)
+    })
+  }
+
+  function cancelPendingAssessment() {
+    if (!riskAssessment?.assessment_id) return
+    runAction('risk-cancel', async () => {
+      const cancelled = await api('/api/escalation/cancel', {
+        method: 'POST',
+        body: JSON.stringify({ assessment_id: riskAssessment.assessment_id, reason: 'Passenger used discreet check-in control' }),
+      })
+      setNotificationMessage(`Discreet cancellation recorded (${cancelled.state}). No real notification was sent.`)
+      await refreshWorkspace()
+    })
+  }
+
+  function processPendingEscalation() {
+    if (!riskAssessment?.assessment_id) return
+    runAction('risk-process', async () => {
+      const result = await api('/api/escalation/process', {
+        method: 'POST',
+        body: JSON.stringify({ assessment_id: riskAssessment.assessment_id }),
+      })
+      setNotificationMessage(`Mock escalation state: ${result.state}. No real contact or emergency service was contacted.`)
+      await refreshWorkspace()
+    })
+  }
+
   function testNotification(contactId) {
     runAction('notification', async () => {
       const result = await api('/api/notifications/test', {
@@ -275,10 +333,33 @@ export default function App() {
             <small>Maximum in one frame</small>
           </article>
           <article className="card">
-            <p>Safety assessment</p>
-            <h3 className="amber-text">Unknown</h3>
-            <small>No validated risk classifier</small>
+            <p>Rule-based risk score</p>
+            <h3 className="amber-text">{riskAssessment ? `${riskAssessment.risk_score}/100` : '—'}</h3>
+            <small>{riskAssessment ? `${riskAssessment.risk_level.toUpperCase()} · simulated assessment` : 'No assessment yet'}</small>
           </article>
+        </section>
+
+        <section className="risk-panel panel" aria-labelledby="risk-title">
+          <div className="panel-title"><div><p className="eyebrow">MULTI-SIGNAL RULE ENGINE</p><h2 id="risk-title">Current assessment</h2></div><span className={`risk-pill risk-${riskAssessment?.risk_level ?? 'unknown'}`}>{riskAssessment?.risk_level?.toUpperCase() ?? 'UNKNOWN'}</span></div>
+          {riskError && <p className="error" role="alert">Risk data unavailable: {riskError}</p>}
+          {!riskAssessment ? <p className="empty-inline">No assessment available. Inputs not submitted are unknown, never treated as safe.</p> : <>
+            <div className="risk-score-row"><strong>{riskAssessment.risk_score}</strong><span>/ 100 · prototype rule score</span><small>{riskAssessment.source?.toUpperCase()}</small></div>
+            <div className="signal-cards">
+              {riskAssessment.signals_used.map((signal) => <div className="signal-card" key={signal.name}><span>{signal.name.replaceAll('_', ' ')}</span><b className={`source-${signal.source}`}>{signal.source.toUpperCase()}</b><small>{signal.status}{signal.reliability != null ? ` · reliability ${Math.round(signal.reliability * 100)}%` : ''}</small></div>)}
+            </div>
+            <div className="risk-details"><div><strong>Reasons</strong>{riskAssessment.reasons.map((reason, index) => <p key={`${reason.signal}-${index}`}>{reason.explanation} {reason.points > 0 ? `(+${reason.points})` : ''}</p>)}</div><div><strong>Data quality</strong>{riskAssessment.data_quality.missing_or_uncertain.length ? <ul>{riskAssessment.data_quality.missing_or_uncertain.map((item) => <li key={item}>{item}</li>)}</ul> : <p>No missing signals reported.</p>}</div></div>
+            <p className="risk-action"><strong>Recommended:</strong> {riskAssessment.recommended_action}</p>
+            <p className="risk-unknown-notice">Unknown signals are not evidence of safety. This score describes only the supplied observations.</p>
+            <p className="fine-print">{riskAssessment.disclaimer}</p>
+          </>}
+          <div className="risk-demo-controls" aria-label="Simulated risk scenarios">
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('route')}>Simulate route deviation</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('stop')}>Simulate prolonged stop</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('combined')}>Simulate corroborated critical</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('unknown')}>Simulate camera unavailable</button>
+          </div>
+          <div className="discreet-row"><label><input type="checkbox" checked={discreetMode} onChange={(event) => setDiscreetMode(event.target.checked)} /> Discreet check-in controls</label><div className="escalation-actions">{riskAssessment?.escalation_state === 'escalation_pending' && <button type="button" disabled={!online || !!busyAction} onClick={processPendingEscalation}>Run mock escalation</button>}<button type="button" disabled={!online || !!busyAction || !riskAssessment || !['check_in_required', 'escalation_pending'].includes(riskAssessment.escalation_state)} onClick={cancelPendingAssessment}>{discreetMode ? "I'm OK · cancel pending" : 'Cancel pending demo escalation'}</button></div></div>
+          {riskAssessment.notification && <p className="notice" role="status">Mock provider: {riskAssessment.notification.status}. {riskAssessment.notification.provider_response?.message} Real contact notification: no.</p>}
         </section>
 
         {actionError && <p className="error" role="alert">{actionError}</p>}
@@ -440,6 +521,17 @@ export default function App() {
             {assistantAnswer && <div className="assistant-answer" role="status"><strong>Local rules assistant</strong><p>{assistantAnswer.answer}</p><small>{assistantAnswer.disclaimer}</small></div>}
             <div className="note"><strong>Safety remains unknown</strong><p>The assistant summarizes recorded facts and rule thresholds. It is not a risk predictor or emergency advisor.</p></div>
           </article>
+        </section>
+
+        <section className="panel escalation-panel">
+          <div className="panel-title"><div><p className="eyebrow">AUDITABLE STATE MACHINE</p><h2>Escalation and delivery history</h2></div><span className="tag">MOCK PROVIDER ONLY</span></div>
+          {escalations.length === 0 ? <p className="empty-inline">No escalation state changes recorded.</p> : <ol className="timeline-list">{escalations.slice(0, 8).map((record) => <li key={record.id} className="timeline-item"><span className="severity-mark severity-info" aria-hidden="true" /><div className="timeline-copy"><div className="timeline-heading"><strong>{record.state.replaceAll('_', ' ')}</strong><small>{new Date(record.occurred_at).toLocaleString()}</small></div><p>{record.reason}</p>{record.notifications?.map((attempt) => <small key={attempt.id}>Notification: {attempt.status} · {attempt.provider} · no real destination configured</small>)}</div></li>)}</ol>}
+          <p className="fine-print">Demo mode cannot send to trusted contacts, police, or emergency services. “Notified” refers only to the mock provider's simulated result.</p>
+        </section>
+
+        <section className="panel risk-history-panel">
+          <div className="panel-title"><div><p className="eyebrow">ASSESSMENT HISTORY</p><h2>Recent risk assessments</h2></div><span className="tag">{riskHistory.length} RECORDS</span></div>
+          {riskHistory.length === 0 ? <p className="empty-inline">No risk assessments recorded.</p> : <ol className="risk-history-list">{riskHistory.slice(0, 8).map((assessment) => <li key={assessment.assessment_id}><time>{new Date(assessment.timestamp).toLocaleString()}</time><strong className={`source-${assessment.source}`}>{assessment.risk_level.toUpperCase()}</strong><span>{assessment.risk_score}/100</span><small>{assessment.source.toUpperCase()}</small></li>)}</ol>}
         </section>
 
         <section className="panel contacts-panel" id="contacts">

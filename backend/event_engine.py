@@ -201,6 +201,8 @@ class EventEngine:
             "deleted_demo_events": deleted,
             "demo_data_only": True,
             "non_demo_events_preserved": True,
+            "demo_risk_assessments_cleared": True,
+            "demo_escalation_records_cleared": True,
         }
 
     def configure(self, config: MonitoringConfig) -> dict:

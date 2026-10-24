@@ -138,6 +138,68 @@ class SQLiteRepositoryTests(unittest.TestCase):
         connection.close()
         self.assertEqual(json.loads(details)["note"], event["note"])
 
+    def test_risk_assessment_escalation_and_notification_survive_restart(self):
+        assessment = {
+            "assessment_id": "assessment-1",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "risk_score": 72,
+            "risk_level": "critical",
+            "reasons": [{"signal": "gps", "points": 30, "explanation": "Simulated route deviation."}],
+            "signals_used": [{"name": "gps", "source": "simulated", "status": "available"}],
+            "data_quality": {"missing_or_uncertain": []},
+            "recommended_action": "Run mock workflow.",
+            "source": "simulated",
+            "is_demo": True,
+        }
+        self.repository.save_risk_assessment(assessment)
+        state = self.repository.save_escalation_state("assessment-1", "escalation_pending", "Corroborated", True)
+        attempt = {
+            "id": "attempt-1",
+            "assessment_id": "assessment-1",
+            "idempotency_key": "incident:demo-1",
+            "provider": "mock",
+            "status": "delivered",
+            "attempted_at": datetime.now(timezone.utc).isoformat(),
+            "provider_response": {"mock": True},
+            "error_detail": None,
+        }
+        self.repository.save_notification_attempt(attempt)
+
+        fresh = SQLiteRepository(self.db_path)
+        self.assertEqual(fresh.list_risk_assessments()[0]["risk_score"], 72)
+        self.assertEqual(fresh.list_escalations()[0]["id"], state["id"])
+        self.assertEqual(fresh.get_notification_by_key("incident:demo-1")["id"], "attempt-1")
+
+    def test_demo_reset_removes_demo_risk_records_but_preserves_real_records(self):
+        base = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "risk_score": 20,
+            "risk_level": "medium",
+            "reasons": [],
+            "signals_used": [],
+            "data_quality": {},
+            "recommended_action": "Monitor",
+            "source": "simulated",
+        }
+        demo_assessment = {**base, "assessment_id": "demo-assessment", "is_demo": True}
+        real_assessment = {
+            **base,
+            "assessment_id": "real-assessment",
+            "source": "real",
+            "is_demo": False,
+        }
+        self.repository.save_risk_assessment(demo_assessment)
+        self.repository.save_risk_assessment(real_assessment)
+        self.repository.save_escalation_state("demo-assessment", "monitoring", "Demo", True)
+        self.repository.save_escalation_state("real-assessment", "monitoring", "Real", False)
+
+        self.repository.reset_demo_state()
+
+        assessments = self.repository.list_risk_assessments()
+        transitions = self.repository.list_escalations()
+        self.assertEqual([item["assessment_id"] for item in assessments], ["real-assessment"])
+        self.assertEqual([item["assessment_id"] for item in transitions], ["real-assessment"])
+
     def test_parallel_writes_use_independent_connections_safely(self):
         events = [self.make_event() for _ in range(24)]
         with ThreadPoolExecutor(max_workers=8) as pool:

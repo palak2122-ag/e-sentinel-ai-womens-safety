@@ -20,11 +20,21 @@ from backend.event_engine import (
     NotificationTestRequest,
     event_engine,
 )
+from backend.risk_engine import (
+    EscalationCancelRequest,
+    EscalationProcessRequest,
+    RiskAssessmentRequest,
+    RiskEngine,
+    RiskPolicyConfig,
+)
+
+risk_engine = RiskEngine(event_engine.repository)
 
 
 @asynccontextmanager
 async def lifespan(_app):
     event_engine.initialize()
+    risk_engine.initialize()
     yield
 
 
@@ -98,6 +108,78 @@ def safety_status():
         ),
         "monitoring_active": False,
     }
+
+
+@app.post("/api/risk/assessments")
+def create_risk_assessment(request: RiskAssessmentRequest):
+    try:
+        return risk_engine.assess(request)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Risk assessment could not be saved.") from exc
+
+
+@app.get("/api/risk/assessments/latest")
+def latest_risk_assessment():
+    try:
+        return risk_engine.latest()
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Risk assessment history is unavailable.") from exc
+
+
+@app.get("/api/risk/assessments")
+def risk_assessment_history(limit: int = Query(default=50, ge=1, le=100)):
+    try:
+        return {"assessments": risk_engine.history(limit)}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Risk assessment history is unavailable.") from exc
+
+
+@app.put("/api/risk/config")
+def configure_risk_policy(policy: RiskPolicyConfig):
+    try:
+        return risk_engine.configure(policy)
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Risk policy could not be saved.") from exc
+
+
+@app.get("/api/risk/config")
+def current_risk_policy():
+    try:
+        return risk_engine.current_config()
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Risk policy is unavailable.") from exc
+
+
+@app.get("/api/escalation/history")
+def escalation_history(limit: int = Query(default=50, ge=1, le=100)):
+    try:
+        return {
+            "history": risk_engine.escalation_history(limit),
+            "notifications": risk_engine.repository.list_notifications(limit),
+            "real_delivery_enabled": False,
+        }
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Escalation history is unavailable.") from exc
+
+
+@app.post("/api/escalation/cancel")
+def cancel_escalation(request: EscalationCancelRequest):
+    try:
+        return risk_engine.cancel(request.assessment_id, request.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Escalation state could not be saved.") from exc
+
+
+@app.post("/api/escalation/process")
+def process_pending_escalation(request: EscalationProcessRequest):
+    try:
+        return risk_engine.process_pending(request.assessment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Escalation attempt could not be saved.") from exc
 
 
 @app.get("/api/monitoring/state")

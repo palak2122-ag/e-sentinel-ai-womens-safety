@@ -1,12 +1,14 @@
 """Small SQLite repository for local event and monitoring state."""
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import sqlite3
 from threading import Lock
 from typing import Iterator
+from uuid import uuid4
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -97,8 +99,52 @@ class SQLiteRepository:
                         key TEXT PRIMARY KEY,
                         value_json TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS risk_assessments (
+                        assessment_id TEXT PRIMARY KEY,
+                        incident_key TEXT,
+                        occurred_at TEXT NOT NULL,
+                        risk_score INTEGER NOT NULL CHECK (risk_score BETWEEN 0 AND 100),
+                        risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+                        reasons_json TEXT NOT NULL,
+                        signals_json TEXT NOT NULL,
+                        data_quality_json TEXT NOT NULL,
+                        recommended_action TEXT NOT NULL,
+                        source TEXT NOT NULL CHECK (source IN ('real', 'simulated', 'unknown')),
+                        is_demo INTEGER NOT NULL CHECK (is_demo IN (0, 1))
+                    );
+                    CREATE TABLE IF NOT EXISTS risk_policy (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        policy_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_risk_assessments_time
+                        ON risk_assessments (occurred_at DESC);
+                    CREATE TABLE IF NOT EXISTS escalation_history (
+                        id TEXT PRIMARY KEY,
+                        assessment_id TEXT NOT NULL REFERENCES risk_assessments(assessment_id),
+                        state TEXT NOT NULL CHECK (state IN ('monitoring', 'check_in_required', 'escalation_pending', 'notified', 'delivery_failed', 'cancelled')),
+                        occurred_at TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        is_demo INTEGER NOT NULL CHECK (is_demo IN (0, 1))
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_escalation_time
+                        ON escalation_history (occurred_at DESC);
+                    CREATE TABLE IF NOT EXISTS notification_attempts (
+                        id TEXT PRIMARY KEY,
+                        assessment_id TEXT NOT NULL REFERENCES risk_assessments(assessment_id),
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        provider TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'failed', 'skipped_not_configured')),
+                        attempted_at TEXT NOT NULL,
+                        provider_response TEXT NOT NULL,
+                        error_detail TEXT
+                    );
                     """
                 )
+                risk_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(risk_assessments)")
+                }
+                if "incident_key" not in risk_columns:
+                    connection.execute("ALTER TABLE risk_assessments ADD COLUMN incident_key TEXT")
                 self._initialized = True
             except (OSError, sqlite3.Error) as exc:
                 raise PersistenceError("Local data storage could not be initialized.") from exc
@@ -210,6 +256,15 @@ class SQLiteRepository:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute("DELETE FROM safety_events WHERE is_demo = 1")
             deleted = cursor.rowcount
+            connection.execute(
+                """DELETE FROM notification_attempts WHERE assessment_id IN
+                (SELECT assessment_id FROM risk_assessments WHERE is_demo = 1)"""
+            )
+            connection.execute(
+                """DELETE FROM escalation_history WHERE assessment_id IN
+                (SELECT assessment_id FROM risk_assessments WHERE is_demo = 1)"""
+            )
+            connection.execute("DELETE FROM risk_assessments WHERE is_demo = 1")
             connection.execute("DELETE FROM check_in_history WHERE is_demo = 1")
             connection.execute(
                 "DELETE FROM app_state WHERE key IN ('check_in', 'last_cabin_peak')"
@@ -266,6 +321,203 @@ class SQLiteRepository:
                 "SELECT value_json FROM app_state WHERE key = 'last_cabin_peak'"
             ).fetchone()
         return json.loads(row["value_json"]) if row else None
+
+    def save_risk_assessment(self, assessment: dict) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO risk_assessments (
+                    assessment_id, incident_key, occurred_at, risk_score, risk_level,
+                    reasons_json, signals_json, data_quality_json, recommended_action,
+                    source, is_demo
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    assessment["assessment_id"], assessment.get("incident_key"), assessment["timestamp"],
+                    assessment["risk_score"], assessment["risk_level"],
+                    json.dumps(assessment["reasons"]),
+                    json.dumps(assessment["signals_used"]),
+                    json.dumps(assessment["data_quality"]),
+                    assessment["recommended_action"], assessment["source"],
+                    int(assessment["is_demo"]),
+                ),
+            )
+            connection.commit()
+
+    def save_risk_policy(self, policy: dict) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO risk_policy (id, policy_json) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET policy_json = excluded.policy_json""",
+                (json.dumps(policy, separators=(",", ":")),),
+            )
+            connection.commit()
+
+    def load_risk_policy(self) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT policy_json FROM risk_policy WHERE id = 1"
+            ).fetchone()
+        return json.loads(row["policy_json"]) if row else None
+
+    @staticmethod
+    def _risk_response(row: sqlite3.Row) -> dict:
+        return {
+            "assessment_id": row["assessment_id"],
+            "incident_key": row["incident_key"],
+            "timestamp": row["occurred_at"],
+            "risk_score": row["risk_score"],
+            "risk_level": row["risk_level"],
+            "reasons": json.loads(row["reasons_json"]),
+            "signals_used": json.loads(row["signals_json"]),
+            "data_quality": json.loads(row["data_quality_json"]),
+            "recommended_action": row["recommended_action"],
+            "source": row["source"],
+            "is_demo": bool(row["is_demo"]),
+        }
+
+    def list_risk_assessments(self, limit: int = 50) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM risk_assessments ORDER BY occurred_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._risk_response(row) for row in rows]
+
+    def save_escalation_state(self, assessment_id: str, state: str, reason: str, is_demo: bool) -> dict:
+        record = {
+            "id": str(uuid4()),
+            "assessment_id": assessment_id,
+            "state": state,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "is_demo": is_demo,
+        }
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO escalation_history VALUES (?, ?, ?, ?, ?, ?)",
+                tuple(record.values()),
+            )
+            connection.commit()
+        return record
+
+    def latest_escalation(self) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM escalation_history ORDER BY occurred_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_escalation_for(self, assessment_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM escalation_history
+                WHERE assessment_id = ? ORDER BY occurred_at DESC, rowid DESC LIMIT 1""",
+                (assessment_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_escalation_history(self, limit: int = 50) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM escalation_history ORDER BY occurred_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_notification_attempt(self, attempt: dict) -> dict:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO notification_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    attempt["id"], attempt["assessment_id"], attempt["idempotency_key"],
+                    attempt["provider"], attempt["status"], attempt["attempted_at"],
+                    json.dumps(attempt["provider_response"]), attempt.get("error_detail"),
+                ),
+            )
+            connection.commit()
+        return attempt
+
+    def reserve_notification_attempt(self, attempt: dict) -> tuple[dict, bool]:
+        """Atomically reserve an idempotency key before invoking a provider."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO notification_attempts
+                VALUES (?, ?, ?, ?, 'pending', ?, '{}', NULL)""",
+                (
+                    attempt["id"], attempt["assessment_id"], attempt["idempotency_key"],
+                    attempt["provider"], attempt["attempted_at"],
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM notification_attempts WHERE idempotency_key = ?",
+                (attempt["idempotency_key"],),
+            ).fetchone()
+            connection.commit()
+        saved = dict(row)
+        saved["provider_response"] = json.loads(saved["provider_response"])
+        return saved, cursor.rowcount == 1
+
+    def finish_notification_attempt(self, attempt_id: str, status: str,
+                                    provider_response: dict, error_detail: str | None) -> dict:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE notification_attempts
+                SET status = ?, provider_response = ?, error_detail = ? WHERE id = ?""",
+                (status, json.dumps(provider_response), error_detail, attempt_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM notification_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            connection.commit()
+        result = dict(row)
+        result["provider_response"] = json.loads(result["provider_response"])
+        return result
+
+    def get_notification_by_key(self, idempotency_key: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM notification_attempts WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["provider_response"] = json.loads(result["provider_response"])
+        return result
+
+    def list_notifications(self, limit: int = 50) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM notification_attempts ORDER BY attempted_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["provider_response"] = json.loads(item["provider_response"])
+            result.append(item)
+        return result
+
+    def get_risk_assessment(self, assessment_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM risk_assessments WHERE assessment_id = ?",
+                (assessment_id,),
+            ).fetchone()
+        return self._risk_response(row) if row else None
+
+    def list_escalations(self, limit: int = 50) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM escalation_history ORDER BY occurred_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
 
 # Configured by ESENTINEL_DB_PATH, or data/e_sentinel.db by default.

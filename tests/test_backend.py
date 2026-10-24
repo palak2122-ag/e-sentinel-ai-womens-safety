@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from backend import main
 from backend.database import PersistenceError, SQLiteRepository
 from backend.event_engine import EventEngine, MonitoringConfig
+from backend.risk_engine import RiskEngine
 
 
 class FakeCapture:
@@ -66,6 +67,8 @@ class BackendApiTests(unittest.TestCase):
             SQLiteRepository(f"{self.temp_dir.name}/test.db")
         )
         main.event_engine.initialize()
+        main.risk_engine = RiskEngine(main.event_engine.repository)
+        main.risk_engine.initialize()
         main.event_engine.reset()
         main.event_engine.configure(MonitoringConfig())
         main.event_engine.set_contacts([])
@@ -297,6 +300,114 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(len(listed), 2)
         self.assertNotIn("a@example.org", str(listed))
         self.assertNotIn("+15551234567", str(listed))
+
+    def test_risk_assessment_api_contract_and_missing_signals(self):
+        response = self.client.post("/api/risk/assessments", json={"demo_mode": True})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        assessment = response.json()
+        self.assertEqual(assessment["risk_level"], "low")
+        self.assertEqual(assessment["risk_score"], 0)
+        self.assertEqual(len(assessment["signals_used"]), 4)
+        self.assertEqual(assessment["source"], "unknown")
+        self.assertTrue(assessment["is_demo"])
+        self.assertTrue(assessment["data_quality"]["missing_or_uncertain"])
+        self.assertIn("assessment_id", self.client.get("/api/risk/assessments/latest").json())
+
+    def test_risk_input_rejects_impossible_sensor_values(self):
+        response = self.client.post(
+            "/api/risk/assessments",
+            json={"demo_mode": False, "vehicle": {"source": "real", "speed_kph": -5}},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_critical_scenario_uses_mock_escalation_and_incident_idempotency(self):
+        main.risk_engine.escalation_enabled = True
+        payload = {
+            "demo_mode": True,
+            "incident_key": "scenario-critical-001",
+            "gps": {"source": "simulated", "deviation_meters": 1500},
+            "vehicle": {"source": "simulated", "stopped_minutes": 12, "sudden_braking": True},
+            "check_in": {"source": "simulated", "responded": False, "overdue_minutes": 25},
+        }
+        first = self.client.post("/api/risk/assessments", json=payload)
+        second = self.client.post("/api/risk/assessments", json=payload)
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["risk_level"], "critical")
+        self.assertEqual(first.json()["escalation_state"], "escalation_pending")
+        processed = self.client.post(
+            "/api/escalation/process",
+            json={"assessment_id": first.json()["assessment_id"]},
+        )
+        self.assertEqual(processed.status_code, 200)
+        self.assertEqual(processed.json()["state"], "notified")
+        self.assertEqual(processed.json()["notification"]["provider"], "mock")
+        self.assertIn("no person was contacted", processed.json()["notification"]["provider_response"]["message"])
+        repeated = self.client.post(
+            "/api/escalation/process",
+            json={"assessment_id": second.json()["assessment_id"]},
+        )
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(repeated.json()["notification"]["id"], processed.json()["notification"]["id"])
+        self.assertEqual(len(self.client.get("/api/escalation/history").json()["notifications"]), 1)
+        history = self.client.get("/api/escalation/history").json()
+        self.assertTrue(history["history"])
+        self.assertFalse(history["real_delivery_enabled"])
+
+    def test_high_risk_can_be_cancelled_and_recorded(self):
+        assessment = self.client.post(
+            "/api/risk/assessments",
+            json={
+                "demo_mode": True,
+                "gps": {"source": "simulated", "deviation_meters": 800},
+                "check_in": {"source": "simulated", "responded": False, "overdue_minutes": 12},
+            },
+        )
+        self.assertEqual(assessment.status_code, 200, assessment.text)
+        self.assertEqual(assessment.json()["escalation_state"], "check_in_required")
+        cancelled = self.client.post(
+            "/api/escalation/cancel",
+            json={"assessment_id": assessment.json()["assessment_id"], "reason": "Passenger confirmed"},
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["state"], "cancelled")
+        self.assertFalse(cancelled.json()["real_notification_sent"])
+
+    def test_critical_escalation_can_be_cancelled_before_mock_processing(self):
+        main.risk_engine.escalation_enabled = True
+        response = self.client.post(
+            "/api/risk/assessments",
+            json={
+                "demo_mode": True,
+                "gps": {"source": "simulated", "deviation_meters": 1000},
+                "vehicle": {"source": "simulated", "stopped_minutes": 15, "sudden_braking": True},
+                "check_in": {"source": "simulated", "responded": False, "overdue_minutes": 20},
+            },
+        )
+        self.assertEqual(response.json()["escalation_state"], "escalation_pending")
+        cancelled = self.client.post(
+            "/api/escalation/cancel",
+            json={"assessment_id": response.json()["assessment_id"]},
+        )
+        self.assertEqual(cancelled.json()["state"], "cancelled")
+
+    def test_demo_reset_clears_simulated_risk_but_keeps_real_risk(self):
+        simulated = self.client.post(
+            "/api/risk/assessments", json={"demo_mode": True}
+        ).json()
+        real = self.client.post(
+            "/api/risk/assessments",
+            json={"demo_mode": False, "gps": {"source": "real", "deviation_meters": 30}},
+        ).json()
+
+        reset = self.client.delete("/api/events/demo")
+        remaining = self.client.get("/api/risk/assessments").json()["assessments"]
+
+        self.assertTrue(reset.json()["demo_risk_assessments_cleared"])
+        self.assertEqual([item["assessment_id"] for item in remaining], [real["assessment_id"]])
+        self.assertNotIn(simulated["assessment_id"], str(remaining))
 
 
 class EventEngineTests(unittest.TestCase):
