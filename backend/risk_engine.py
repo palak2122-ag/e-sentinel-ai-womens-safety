@@ -410,15 +410,51 @@ class RiskEngine:
             state = "escalation_pending"
         record = None
         if state != "escalation_pending":
-            record = self.repository.save_escalation_state(
-                assessment_id, state,
-                "Mock provider result; no real contact was contacted.", assessment["is_demo"]
+            outcome = (
+                "simulated_delivered"
+                if notification["provider"] == "mock" and notification["status"] == "delivered"
+                else notification["status"]
+            )
+            record, _ = self.repository.transition_escalation_state(
+                assessment_id,
+                state,
+                "Mock provider result; no real contact was contacted.",
+                assessment["is_demo"],
+                {"escalation_pending"},
+                event_type="demo_escalation_delivery" if assessment["is_demo"] else "risk_escalation_delivery",
+                provider_mode=notification["provider"],
+                delivery_outcome=outcome,
             )
         return {
             "assessment_id": assessment_id,
             "state": state,
             "notification": notification,
             "transition": record,
+            "real_notification_sent": False,
+        }
+
+    def request_demo_escalation(self, assessment_id: str) -> dict:
+        assessment = self.repository.get_risk_assessment(assessment_id)
+        if assessment is None:
+            raise ValueError("Risk assessment was not found.")
+        if not assessment["is_demo"]:
+            raise ValueError("Only explicitly simulated assessments can use the demo escalation workflow.")
+        if assessment["risk_level"] not in {"high", "critical"}:
+            raise ValueError("The demo escalation workflow is available only for high or critical rule-based assessments.")
+        record, created = self.repository.transition_escalation_state(
+            assessment_id,
+            "escalation_pending",
+            "User explicitly requested the simulated escalation workflow.",
+            True,
+            {"check_in_required", "escalation_pending"},
+            event_type="demo_escalation_requested",
+            provider_mode="mock",
+        )
+        return {
+            "assessment_id": assessment_id,
+            "state": "escalation_pending",
+            "transition": record,
+            "idempotent_replay": not created,
             "real_notification_sent": False,
         }
 
@@ -433,11 +469,14 @@ class RiskEngine:
             raise ValueError("This assessment is not waiting for a passenger check-in.")
         occurred_at = self._utc_now().isoformat()
         self.repository.save_passenger_check_in(occurred_at, assessment_id)
-        transition = self.repository.save_escalation_state(
+        transition, _ = self.repository.transition_escalation_state(
             assessment_id,
             "monitoring",
             "Passenger explicitly responded to the check-in; this is not a safety determination.",
             assessment["is_demo"],
+            {"check_in_required", "escalation_pending"},
+            event_type="passenger_check_in",
+            provider_mode="none",
         )
         return {
             "assessment_id": assessment_id,
@@ -488,10 +527,21 @@ class RiskEngine:
             "check_in_required", "escalation_pending"
         }:
             raise ValueError("This assessment has no cancellable pending escalation.")
-        record = self.repository.save_escalation_state(
-            assessment_id, "cancelled", reason, assessment["is_demo"]
+        record, created = self.repository.transition_escalation_state(
+            assessment_id,
+            "cancelled",
+            reason,
+            assessment["is_demo"],
+            {"check_in_required", "escalation_pending"},
+            event_type="escalation_cancelled",
+            provider_mode="none",
         )
-        return {"state": "cancelled", "record": record, "real_notification_sent": False}
+        return {
+            "state": "cancelled",
+            "record": record,
+            "idempotent_replay": not created,
+            "real_notification_sent": False,
+        }
 
     def escalation_history(self, limit: int = 50) -> list[dict]:
         records = self.repository.list_escalations(limit)

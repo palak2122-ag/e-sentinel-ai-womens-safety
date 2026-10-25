@@ -170,6 +170,24 @@ class SQLiteRepository:
                         id INTEGER PRIMARY KEY CHECK (id = 1),
                         policy_json TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS trusted_contacts (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        channel TEXT NOT NULL CHECK (channel IN ('email', 'sms')),
+                        destination TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS contact_notification_tests (
+                        id TEXT PRIMARY KEY,
+                        contact_id TEXT,
+                        provider TEXT NOT NULL,
+                        outcome TEXT NOT NULL,
+                        attempted_at TEXT NOT NULL,
+                        response_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_contact_notification_tests_time
+                        ON contact_notification_tests (attempted_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_risk_assessments_time
                         ON risk_assessments (occurred_at DESC);
                     CREATE TABLE IF NOT EXISTS escalation_history (
@@ -178,7 +196,10 @@ class SQLiteRepository:
                         state TEXT NOT NULL CHECK (state IN ('monitoring', 'check_in_required', 'escalation_pending', 'notified', 'delivery_failed', 'cancelled')),
                         occurred_at TEXT NOT NULL,
                         reason TEXT NOT NULL,
-                        is_demo INTEGER NOT NULL CHECK (is_demo IN (0, 1))
+                        is_demo INTEGER NOT NULL CHECK (is_demo IN (0, 1)),
+                        event_type TEXT NOT NULL DEFAULT 'risk_assessment',
+                        provider_mode TEXT NOT NULL DEFAULT 'none',
+                        delivery_outcome TEXT NOT NULL DEFAULT 'not_attempted'
                     );
                     CREATE INDEX IF NOT EXISTS idx_escalation_time
                         ON escalation_history (occurred_at DESC);
@@ -203,6 +224,18 @@ class SQLiteRepository:
                     connection.execute("ALTER TABLE risk_assessments ADD COLUMN journey_id TEXT")
                 if "event_id" not in risk_columns:
                     connection.execute("ALTER TABLE risk_assessments ADD COLUMN event_id TEXT")
+                escalation_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(escalation_history)")
+                }
+                for column, default in (
+                    ("event_type", "risk_assessment"),
+                    ("provider_mode", "none"),
+                    ("delivery_outcome", "not_attempted"),
+                ):
+                    if column not in escalation_columns:
+                        connection.execute(
+                            f"ALTER TABLE escalation_history ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'"
+                        )
                 journey_columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(journeys)")
                 }
@@ -840,9 +873,15 @@ class SQLiteRepository:
                 "occurred_at": assessment["timestamp"],
                 "reason": reason,
                 "is_demo": assessment["is_demo"],
+                "event_type": "risk_assessment",
+                "provider_mode": "mock" if assessment["is_demo"] else "none",
+                "delivery_outcome": "not_attempted",
             }
             connection.execute(
-                "INSERT INTO escalation_history VALUES (?, ?, ?, ?, ?, ?)",
+                """INSERT INTO escalation_history (
+                    id, assessment_id, state, occurred_at, reason, is_demo,
+                    event_type, provider_mode, delivery_outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 tuple(escalation.values()),
             )
             row = connection.execute(
@@ -906,7 +945,9 @@ class SQLiteRepository:
             ).fetchall()
         return [self._risk_response(row) for row in rows]
 
-    def save_escalation_state(self, assessment_id: str, state: str, reason: str, is_demo: bool) -> dict:
+    def save_escalation_state(
+        self, assessment_id: str, state: str, reason: str, is_demo: bool
+    ) -> dict:
         record = {
             "id": str(uuid4()),
             "assessment_id": assessment_id,
@@ -914,15 +955,67 @@ class SQLiteRepository:
             "occurred_at": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
             "is_demo": is_demo,
+            "event_type": "risk_assessment",
+            "provider_mode": "mock" if is_demo else "none",
+            "delivery_outcome": "not_attempted",
         }
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                "INSERT INTO escalation_history VALUES (?, ?, ?, ?, ?, ?)",
+                """INSERT INTO escalation_history (
+                    id, assessment_id, state, occurred_at, reason, is_demo,
+                    event_type, provider_mode, delivery_outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 tuple(record.values()),
             )
             connection.commit()
         return record
+
+    def transition_escalation_state(
+        self,
+        assessment_id: str,
+        state: str,
+        reason: str,
+        is_demo: bool,
+        allowed_states: set[str],
+        *,
+        event_type: str,
+        provider_mode: str,
+        delivery_outcome: str = "not_attempted",
+    ) -> tuple[dict, bool]:
+        record = {
+            "id": str(uuid4()),
+            "assessment_id": assessment_id,
+            "state": state,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "is_demo": is_demo,
+            "event_type": event_type,
+            "provider_mode": provider_mode,
+            "delivery_outcome": delivery_outcome,
+        }
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            latest = connection.execute(
+                """SELECT * FROM escalation_history
+                WHERE assessment_id = ? ORDER BY occurred_at DESC, rowid DESC LIMIT 1""",
+                (assessment_id,),
+            ).fetchone()
+            if latest is not None and latest["state"] == state:
+                connection.commit()
+                return dict(latest), False
+            if latest is None or latest["state"] not in allowed_states:
+                connection.rollback()
+                raise ValueError("The escalation state changed before this action could be recorded.")
+            connection.execute(
+                """INSERT INTO escalation_history (
+                    id, assessment_id, state, occurred_at, reason, is_demo,
+                    event_type, provider_mode, delivery_outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(record.values()),
+            )
+            connection.commit()
+        return record, True
 
     def latest_escalation(self) -> dict | None:
         with self._connection() as connection:
@@ -1040,6 +1133,138 @@ class SQLiteRepository:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _contact_response(row: sqlite3.Row) -> dict:
+        return dict(row)
+
+    def list_contacts(self) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM trusted_contacts ORDER BY created_at, rowid"
+            ).fetchall()
+        return [self._contact_response(row) for row in rows]
+
+    def replace_contacts(self, contacts: list[dict]) -> list[dict]:
+        now = datetime.now(timezone.utc).isoformat()
+        saved = []
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM trusted_contacts")
+            for contact in contacts:
+                record = {
+                    **contact,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                connection.execute(
+                    """INSERT INTO trusted_contacts (
+                        id, name, channel, destination, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    tuple(record[key] for key in (
+                        "id", "name", "channel", "destination", "created_at", "updated_at"
+                    )),
+                )
+                saved.append(record)
+            connection.commit()
+        return saved
+
+    def add_contact(self, contact: dict) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        record = {
+            **contact,
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            count = connection.execute(
+                "SELECT COUNT(*) FROM trusted_contacts"
+            ).fetchone()[0]
+            if count >= 5:
+                connection.rollback()
+                raise ValueError("You can save up to five trusted contacts.")
+            connection.execute(
+                """INSERT INTO trusted_contacts (
+                    id, name, channel, destination, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                tuple(record[key] for key in (
+                    "id", "name", "channel", "destination", "created_at", "updated_at"
+                )),
+            )
+            connection.commit()
+        return record
+
+    def update_contact(self, contact_id: str, contact: dict) -> dict | None:
+        updated_at = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """UPDATE trusted_contacts
+                SET name = ?, channel = ?, destination = ?, updated_at = ?
+                WHERE id = ?""",
+                (
+                    contact["name"], contact["channel"], contact["destination"],
+                    updated_at, contact_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM trusted_contacts WHERE id = ?", (contact_id,)
+            ).fetchone()
+            connection.commit()
+        return self._contact_response(row) if cursor.rowcount else None
+
+    def delete_contact(self, contact_id: str) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "DELETE FROM trusted_contacts WHERE id = ?", (contact_id,)
+            )
+            connection.commit()
+        return cursor.rowcount > 0
+
+    def save_contact_notification_test(
+        self, contact_id: str | None, provider: str, outcome: str, response: dict
+    ) -> dict:
+        record = {
+            "id": str(uuid4()),
+            "contact_id": contact_id,
+            "provider": provider,
+            "outcome": outcome,
+            "attempted_at": datetime.now(timezone.utc).isoformat(),
+            "response": response,
+        }
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO contact_notification_tests (
+                    id, contact_id, provider, outcome, attempted_at, response_json
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    record["id"], record["contact_id"], record["provider"],
+                    record["outcome"], record["attempted_at"],
+                    json.dumps(record["response"], separators=(",", ":")),
+                ),
+            )
+            connection.commit()
+        return record
+
+    def list_contact_notification_tests(self, limit: int = 50) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM contact_notification_tests
+                ORDER BY attempted_at DESC, rowid DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                **{key: row[key] for key in (
+                    "id", "contact_id", "provider", "outcome", "attempted_at"
+                )},
+                "response": json.loads(row["response_json"]),
+            }
+            for row in rows
+        ]
 
 
 # Configured by ESENTINEL_DB_PATH, or data/e_sentinel.db by default.

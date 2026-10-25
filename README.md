@@ -15,7 +15,7 @@ Backend:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8002
 ```
 
 Frontend:
@@ -26,9 +26,9 @@ npm install
 npm run dev
 ```
 
-Open the URL Vite prints (normally `http://localhost:5173`). The Vite `/api` proxy forwards requests to `http://127.0.0.1:8000`. API docs: `http://127.0.0.1:8000/docs`.
+Open the URL Vite prints (normally `http://localhost:5173`). The Vite `/api` proxy forwards requests to `http://127.0.0.1:8002`. API docs: `http://127.0.0.1:8002/docs`. Port 8002 avoids both the occupied legacy service on 8000 and the stale e-Sentinel backend currently occupying 8001; neither process is stopped or reconfigured.
 
-If `.venv` does not exist, create it with `py -m venv .venv`, activate it, then run `pip install -r requirements.txt`. Use Python and package pins supported by the host if an existing pin is unavailable. To select the database from PowerShell, set `$env:ESENTINEL_DB_PATH = 'data/e_sentinel.db'` before launching Uvicorn. No `.env` is required. There is no external map, LLM, email, or SMS provider configured, so no API credentials are needed for the demo.
+If `.venv` does not exist, create it with `py -m venv .venv`, activate it, then run `pip install -r requirements.txt`. Use Python and package pins supported by the host if an existing pin is unavailable. The model defaults to the absolute project-root path derived from `backend/main.py`; to override it, set `$env:ESENTINEL_MODEL_PATH` to a model file path before launching Uvicorn. At startup, the backend logs the resolved model path and whether that file exists; `GET /api/health` reports the process ID, backend module, and model availability so you can identify the process serving requests. To select the database from PowerShell, set `$env:ESENTINEL_DB_PATH = 'data/e_sentinel.db'` before launching Uvicorn. No `.env` is required. There is no external map, LLM, email, or SMS provider configured, so no API credentials are needed for the demo.
 
 ## Complete demo
 
@@ -36,10 +36,10 @@ If `.venv` does not exist, create it with `py -m venv .venv`, activate it, then 
 2. Upload `data/cabin_test.mp4`, run analysis, and inspect counts, confidence, and the annotated sampled frame.
 3. Enter a destination and optional waypoint coordinates, explicitly start a journey, grant browser geolocation permission, and confirm the active status. A route deviation requires at least two waypoints; GPS stop observations need repeated accurate fixes.
 4. Inspect a generated journey observation, its linked real-source GPS assessment, event, confidence/accuracy context, and recommended next step. Missing camera/vehicle/check-in inputs remain unknown.
-5. Respond to a waiting risk check-in or cancel a pending mock escalation; no real notification is sent. End the journey and verify it appears in recent history. Reloading does not restart the browser location watcher; resume it explicitly.
+5. Run a simulated rule assessment and verify it appears in risk history. For an explicitly simulated high/critical result, choose “Run mock escalation” to record the requested, pending, and simulated delivery transitions; no real notification is sent. End the journey and verify it appears in recent history. Reloading does not restart the browser location watcher; resume it explicitly.
 6. Use the separately labelled simulated route/stop/check-in controls if browser GPS is unavailable.
 7. Record a simulated passenger check-in and compare the displayed status.
-8. Add a trusted contact, inspect the redacted destination, then run its test notification. The response explicitly confirms nothing was sent.
+8. Add or edit a trusted contact, inspect the redacted destination, then run its test notification. Contact changes and test outcomes persist in the local SQLite database; the test explicitly confirms nothing was sent.
 9. Ask the local assistant to summarize events or explain the latest rule.
 10. Trigger SOS explicitly; confirm it creates a critical demo event but does not contact anyone. Reset demo events.
 
@@ -58,7 +58,7 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 
 ## API
 
-- `GET /` and `GET /api/health`: service identity and health.
+- `GET /` and `GET /api/health`: service identity and health; health includes the serving process ID, backend module, and model availability.
 - `GET /api/safety-status`: compatibility response with `risk_level: UNKNOWN`.
 - `POST /api/analyze-cabin`: multipart `file`; MP4/AVI/MOV/MKV, at most 100 MiB. Preserves existing response fields and adds frame/confidence/settings summaries, optional annotated `data:image/jpeg;base64,...` preview, and `event_created` when the observed peak changes. Counts remain frame-level detections, never unique identities.
 - `GET /api/monitoring/state`: current demo mode, route illustration, simulated check-in, thresholds, and unknown risk state.
@@ -76,12 +76,13 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 - `DELETE /api/events/demo`: reset demo events and simulated check-in state.
 - `GET /api/incidents/summary`: generated in-memory event summary and severity counts.
 - `POST /api/assistant/query`: summarize event history or explain the latest rule with the local rules assistant; no external LLM is called.
-- `GET /api/contacts`, `POST /api/contacts`, `PUT /api/contacts`: view redacted contacts, add one, or replace the list. Destinations exist in process memory only.
-- `POST /api/notifications/test`: exercise test mode. Always reports `delivery_confirmed: false` and `contact_notified: false`.
+- `GET /api/contacts`, `POST /api/contacts`, `PUT /api/contacts`, `DELETE /api/contacts/{contact_id}`: view redacted contacts, add/update/delete a contact, or replace the list. Contact destinations are stored in local SQLite and never returned by the API.
+- `POST /api/notifications/test`: persist a mock test audit. Always reports `delivery_confirmed: false` and `contact_notified: false`; no message is sent.
 - `POST /api/risk/assessments`: submit camera/GPS/vehicle/check-in observations and persist score, reasons, provenance, data quality, recommendation, and escalation state.
 - `GET /api/risk/assessments/latest` and `GET /api/risk/assessments?limit=50`: latest assessment and persisted history.
 - `PUT /api/risk/config`: configure scoring thresholds and escalation opt-in.
 - `GET /api/escalation/history?limit=50`: persisted state transitions and mock notification attempts.
+- `POST /api/escalation/demo`: explicitly queue a high/critical simulated assessment for mock processing; repeated requests are idempotent.
 - `POST /api/escalation/process`: explicitly process a pending escalation through the mock provider.
 - `POST /api/escalation/cancel`: audit a user cancellation for a pending check-in/escalation.
 
@@ -89,7 +90,7 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 
 This transparent rule-based score is a prototype, not a probability of harm, validated model, or certified vehicle safety system. Defaults: GPS deviation adds 30 points when it meets the supplied observation threshold (or configured default 500 m); GPS-derived low movement lasting at least the observation threshold (or default 5 minutes) adds 25; reported sudden braking adds 20; unanswered check-in at least 10 minutes overdue adds 35. A camera detection-count change adds at most 8 weak contextual points and is not proof of distress. Each active signal is weighted by reliability, then the sum is capped at 100. Bands: low 0-19, medium 20-44, high 45-69, critical 70-100.
 
-Missing/unknown sources, stale timestamps (default 300 seconds), reliability below 0.25, poor GPS accuracy, or future timestamps are excluded and reported as unknown. Approved route changes do not score. High risk asks for a discreet check-in. Critical risk requires at least two reliable corroborating signals and no more than two unknowns before it can enter `escalation_pending`; otherwise it remains check-in-required. Pending escalation can be cancelled before an explicit `POST /api/escalation/process` action. Escalation is disabled unless both `ESENTINEL_ESCALATION_ENABLED=true` and API policy configuration explicitly enable it. The only included provider is a network-isolated mock; its “delivered” status means simulated delivery, never a real contact notification. Unknown signals are never interpreted as evidence that a passenger is safe.
+Missing/unknown sources, stale timestamps (default 300 seconds), reliability below 0.25, poor GPS accuracy, or future timestamps are excluded and reported as unknown. Approved route changes do not score. High risk asks for a discreet check-in. Critical risk requires at least two reliable corroborating signals and no more than two unknowns before it can enter `escalation_pending` automatically; otherwise it remains check-in-required. The UI allows an explicit mock-only escalation request for demo high/critical assessments, even when automatic escalation is disabled. The request and delivery state transitions are idempotently audited. The only included provider is a network-isolated mock; its “delivered” status means simulated delivery, never a real contact notification. Unknown signals are never interpreted as evidence that a passenger is safe.
 
 Risk weights and thresholds are configurable with `PUT /api/risk/config`. To demonstrate the mock escalation path in a local session only:
 
@@ -108,7 +109,7 @@ Demo route offset and stop/check-in controls remain user-triggered simulations. 
 ## Privacy, reliability, limitations
 
 - Uploaded video is processed by the local backend. The raw upload is written to an OS temporary file and deleted in request cleanup. The single annotated preview is encoded in memory and returned in the response; it is not retained. Avoid sensitive recordings without consent and authorization.
-- Events, thresholds, cabin peak state, check-ins, journeys, timestamped journey GPS fixes, journey observations and their assessment/event links, risk state, and escalation history persist in local SQLite. Browser coordinates are sensitive location data; obtain consent and end monitoring when no longer needed. Trusted-contact destinations stay in memory only and disappear on backend restart; API responses show masked destination hints. There is no authentication, production access control, or real alert provider.
+- Events, thresholds, cabin peak state, check-ins, journeys, timestamped journey GPS fixes, journey observations and their assessment/event links, risk state, trusted contacts, contact mock-test audit, and escalation history persist in local SQLite. Browser coordinates are sensitive location data; obtain consent and end monitoring when no longer needed. Contact destinations are stored locally but masked in API/UI output and must not be logged. There is no authentication, production access control, encryption-at-rest configuration, or real alert provider.
 - Risk assessments, escalation transitions, mock notification attempts, and risk policy persist in SQLite. Real delivery is not implemented, and the risk-engine environment gate defaults off.
 - The schematic is not a map provider. Browser GPS is shared with this backend only while a user-started journey is actively monitored; closing/reloading the page stops the browser watcher, and monitoring must be resumed explicitly. A secure browser context is required (`localhost` is allowed). There is no external map, route planner, geocoder, ETA source, vehicle telemetry, or live check-in source. Route deviation requires user-supplied waypoint coordinates.
 - Local assistant answers from structured event history/rules. It does not call an LLM or give emergency guidance. No external credentials or `.env.example` are needed.

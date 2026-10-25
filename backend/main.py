@@ -2,6 +2,7 @@
 import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -37,10 +38,18 @@ from backend.risk_engine import (
 
 risk_engine = RiskEngine(event_engine.repository)
 journey_engine = JourneyEngine(event_engine.repository)
+logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
 async def lifespan(_app):
+    logger.info(
+        "Starting e-Sentinel backend: module=%s pid=%s model_path=%s model_exists=%s",
+        __name__,
+        os.getpid(),
+        MODEL_PATH,
+        MODEL_PATH.is_file(),
+    )
     event_engine.initialize()
     risk_engine.initialize()
     journey_engine.initialize()
@@ -55,7 +64,10 @@ app = FastAPI(
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MODEL_PATH = PROJECT_ROOT / "yolov8n.pt"
+MODEL_PATH = Path(os.getenv("ESENTINEL_MODEL_PATH", str(PROJECT_ROOT / "yolov8n.pt"))).expanduser()
+if not MODEL_PATH.is_absolute():
+    MODEL_PATH = PROJECT_ROOT / MODEL_PATH
+MODEL_PATH = MODEL_PATH.resolve()
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
@@ -80,10 +92,14 @@ def get_model():
     global _model
 
     if _model is None:
-        if not MODEL_PATH.exists():
+        if not MODEL_PATH.is_file():
+            logger.error("YOLO weights file not found at resolved path: %s", MODEL_PATH)
             raise HTTPException(
                 status_code=500,
-                detail="YOLO model file yolov8n.pt was not found.",
+                detail=(
+                    f"YOLO weights file was not found at {MODEL_PATH}. "
+                    "Set ESENTINEL_MODEL_PATH or place yolov8n.pt in the project root."
+                ),
             )
         _model = YOLO(str(MODEL_PATH))
 
@@ -104,6 +120,9 @@ def health():
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "backend_module": __name__,
+        "process_id": os.getpid(),
+        "model_available": MODEL_PATH.is_file(),
     }
 
 
@@ -165,10 +184,21 @@ def escalation_history(limit: int = Query(default=50, ge=1, le=100)):
         return {
             "history": risk_engine.escalation_history(limit),
             "notifications": risk_engine.repository.list_notifications(limit),
+            "contact_notification_tests": risk_engine.repository.list_contact_notification_tests(limit),
             "real_delivery_enabled": False,
         }
     except PersistenceError as exc:
         raise HTTPException(status_code=503, detail="Escalation history is unavailable.") from exc
+
+
+@app.post("/api/escalation/demo")
+def request_demo_escalation(request: EscalationProcessRequest):
+    try:
+        return risk_engine.request_demo_escalation(request.assessment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Demo escalation could not be saved.") from exc
 
 
 @app.post("/api/escalation/cancel")
@@ -410,36 +440,60 @@ def assistant_query(question: AssistantQuestion):
 
 @app.get("/api/contacts")
 def trusted_contacts():
-    return {"contacts": event_engine.redacted_contacts(), "storage": "in_memory_only"}
+    try:
+        return {
+            "contacts": event_engine.redacted_contacts(),
+            "storage": "sqlite",
+            "notification_tests": event_engine.repository.list_contact_notification_tests(20),
+        }
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Trusted contacts are unavailable.") from exc
 
 
 @app.put("/api/contacts")
 def save_trusted_contacts(request: ContactListInput):
     try:
         contacts = event_engine.set_contacts(request.contacts)
-        return {"contacts": contacts, "storage": "in_memory_only"}
+        return {"contacts": contacts, "storage": "sqlite"}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Trusted contacts could not be saved.") from exc
 
 
 @app.post("/api/contacts")
 def add_trusted_contact(contact: ContactInput):
     try:
         saved_contact = event_engine.add_contact(contact)
-        return {"contact": saved_contact, "storage": "in_memory_only"}
+        return {"contact": saved_contact, "storage": "sqlite"}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Trusted contact could not be saved.") from exc
 
 
 @app.put("/api/contacts/{contact_id}")
 def update_trusted_contact(contact_id: str, contact: ContactInput):
     try:
         updated_contact = event_engine.update_contact(contact_id, contact)
-        return {"contact": updated_contact, "storage": "in_memory_only"}
+        return {"contact": updated_contact, "storage": "sqlite"}
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Trusted contact could not be updated.") from exc
+
+
+@app.delete("/api/contacts/{contact_id}")
+def delete_trusted_contact(contact_id: str):
+    try:
+        event_engine.delete_contact(contact_id)
+        return {"deleted": True, "storage": "sqlite"}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Trusted contact could not be deleted.") from exc
 
 
 @app.post("/api/monitoring/check-in")
@@ -454,8 +508,10 @@ def simulate_check_in():
 def test_notification(request: NotificationTestRequest):
     try:
         return event_engine.test_notification(request.contact_id)
-    except ValueError as exc:
+    except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Mock notification test could not be recorded.") from exc
 
 
 @app.post("/api/analyze-cabin")

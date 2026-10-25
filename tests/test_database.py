@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
@@ -60,6 +61,35 @@ class SQLiteRepositoryTests(unittest.TestCase):
             }
             <= tables
         )
+
+    def test_initialization_adds_audit_fields_without_dropping_existing_transitions(self):
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            with connection:
+                connection.execute(
+                    """CREATE TABLE escalation_history (
+                        id TEXT PRIMARY KEY,
+                        assessment_id TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        is_demo INTEGER NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    """INSERT INTO escalation_history
+                    VALUES ('legacy-transition', 'legacy-assessment', 'monitoring',
+                            '2025-01-01T00:00:00+00:00', 'Preserved', 1)"""
+                )
+
+        self.repository.initialize()
+
+        transition = self.repository.list_escalation_history()[0]
+        self.assertEqual(transition["id"], "legacy-transition")
+        self.assertEqual(transition["reason"], "Preserved")
+        self.assertEqual(transition["event_type"], "risk_assessment")
+        self.assertEqual(transition["provider_mode"], "none")
+        self.assertEqual(transition["delivery_outcome"], "not_attempted")
 
     def test_journey_location_and_observation_survive_repository_restart(self):
         started = datetime.now(timezone.utc) - timedelta(minutes=2)
@@ -303,6 +333,74 @@ class SQLiteRepositoryTests(unittest.TestCase):
         self.assertEqual(fresh.list_risk_assessments()[0]["risk_score"], 72)
         self.assertEqual(fresh.list_escalations()[0]["id"], state["id"])
         self.assertEqual(fresh.get_notification_by_key("incident:demo-1")["id"], "attempt-1")
+
+    def test_contacts_and_mock_test_audit_survive_repository_restart(self):
+        contact = self.repository.add_contact({
+            "id": "trusted-1",
+            "name": "Trusted",
+            "channel": "email",
+            "destination": "trusted@example.org",
+        })
+        self.repository.save_contact_notification_test(
+            contact["id"],
+            "mock",
+            "simulated_not_sent",
+            {"contact_notified": False, "delivery_confirmed": False},
+        )
+
+        fresh = SQLiteRepository(self.db_path)
+        fresh.initialize()
+
+        self.assertEqual(fresh.list_contacts()[0]["destination"], "trusted@example.org")
+        audit = fresh.list_contact_notification_tests()[0]
+        self.assertEqual(audit["contact_id"], contact["id"])
+        self.assertEqual(audit["outcome"], "simulated_not_sent")
+        self.assertFalse(audit["response"]["contact_notified"])
+
+    def test_escalation_transition_is_recorded_once_and_has_delivery_details(self):
+        assessment = {
+            "assessment_id": "transition-assessment",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "risk_score": 80,
+            "risk_level": "critical",
+            "reasons": [],
+            "signals_used": [],
+            "data_quality": {},
+            "recommended_action": "Explicit demo action.",
+            "source": "simulated",
+            "is_demo": True,
+        }
+        self.repository.save_risk_assessment(assessment)
+        self.repository.save_escalation_state(
+            "transition-assessment", "check_in_required", "Initial state", True
+        )
+
+        transition, created = self.repository.transition_escalation_state(
+            "transition-assessment",
+            "escalation_pending",
+            "User requested demo workflow.",
+            True,
+            {"check_in_required", "escalation_pending"},
+            event_type="demo_escalation_requested",
+            provider_mode="mock",
+        )
+        repeated, repeated_created = self.repository.transition_escalation_state(
+            "transition-assessment",
+            "escalation_pending",
+            "Repeated request.",
+            True,
+            {"check_in_required", "escalation_pending"},
+            event_type="demo_escalation_requested",
+            provider_mode="mock",
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(repeated_created)
+        self.assertEqual(repeated["id"], transition["id"])
+        self.assertEqual(transition["event_type"], "demo_escalation_requested")
+        self.assertEqual(transition["provider_mode"], "mock")
+        self.assertEqual(transition["delivery_outcome"], "not_attempted")
+        self.assertEqual(len(self.repository.list_escalations()), 2)
 
     def test_demo_reset_removes_demo_risk_records_but_preserves_real_records(self):
         base = {

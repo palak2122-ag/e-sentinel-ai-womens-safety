@@ -191,6 +191,10 @@ h2 { font-size: 19px; margin: 7px 0 12px; }
 .contact-list strong { color: #30453b; font-size: 11px; }
 .contact-list small { margin-top: 4px; color: #718078; font-size: 9px; }
 .contact-list button { flex: 0 0 auto; }
+.contact-test-history { margin-top: 14px; padding-top: 12px; border-top: 1px solid #e3e9e3; }
+.contact-test-history > strong { font-size: 11px; }
+.contact-test-history ol { display: grid; gap: 6px; margin: 8px 0 0; padding-left: 18px; }
+.contact-test-history li { display: flex; justify-content: space-between; gap: 12px; color: #718078; font-size: 9px; }
 .contact-form { display: grid; grid-template-columns: 1fr .7fr 1.5fr auto; gap: 10px; align-items: end; }
 .contact-form .primary { width: auto; margin: 0; white-space: nowrap; }
 .notice { padding: 11px 13px; border-radius: 6px; background: #e9f3eb; color: #245c45; font-size: 11px; line-height: 1.5; }
@@ -608,6 +612,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--violet) !importa
 .contact-list li { border-color: var(--line); background: #111a2b; }
 .contact-list strong { color: #e2e8f0; }
 .contact-list small { color: var(--muted); }
+.contact-test-history { border-color: var(--line); }
+.contact-test-history > strong { color: var(--text); }
+.contact-test-history li { color: var(--muted); }
 .contact-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .cancel-edit {
   min-height: 40px;
