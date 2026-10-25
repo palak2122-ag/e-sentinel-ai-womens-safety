@@ -4,7 +4,7 @@ Target: 4 minutes. This demonstrates local processing and explainable demo rules
 
 ## Opening boundary
 
-"e-Sentinel AI combines person detections from a user-uploaded cabin video with a local event timeline. Journey route and check-in signals are simulations. Nothing here identifies a person, detects harassment, or decides that someone is safe."
+"e-Sentinel AI combines person detections from a user-uploaded cabin video with a local event timeline. The journey monitor can use browser GPS only after the user starts a journey and grants permission; route geometry is optional and manually supplied. Nothing here identifies a person, detects harassment, or decides that someone is safe."
 
 Show the connected backend indicator and `LOCAL DEMO` badge.
 
@@ -14,7 +14,7 @@ Upload `data/cabin_test.mp4` and run the analysis. Show processed frames, the 48
 
 ## Journey event engine
 
-Show the schematic route and its `SIMULATED ROUTE` label. Change the route-offset threshold. Create a route-deviation event, an unexpected-stop event, and a missed-check-in event. Open a timeline item's “Why flagged?” details and explain its observed input, threshold rule, inferred signal, and unknowns. Record a simulated check-in, then reset the demo events.
+Show the schematic route and its `ILLUSTRATIVE ONLY · NOT GPS` label before starting a trip. If presenting live location, explicitly start a journey, grant the browser's location request, and point out the displayed accuracy and update time. Planned waypoints must be entered by the user; route deviation is not assessed without them. Change the route-offset threshold, then use the labelled simulation controls for a route-deviation event, unexpected stop, and missed check-in. Open a timeline item's “Why flagged?” details and explain its observed input, threshold rule, inferred signal, and unknowns. Record a simulated check-in, then reset the demo events.
 
 ## Contact and notification workflow
 
@@ -26,4 +26,4 @@ Ask the local assistant why the latest event was flagged. Point out `LOCAL MODE`
 
 ## Close
 
-"The event store and contact settings are in memory and clear when the backend restarts. There is no GPS provider, persistent database, real notification transport, authentication, or validated safety model. Those require consent, privacy and security review, rigorous evaluation, and explicit provider integration before real-world use."
+"Journey records, latest GPS fixes, observations, and the event store persist in local SQLite; contact settings are in memory and clear when the backend restarts. This prototype does not retain a breadcrumb trail and has no route planner, vehicle sensors, ETA source, real notification transport, authentication, or validated safety model. GPS and destination data are sensitive: stop the journey when monitoring is no longer wanted. Real-world use would require stronger privacy/security controls, rigorous evaluation, and authorized provider integrations."

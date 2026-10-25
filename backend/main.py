@@ -20,6 +20,12 @@ from backend.event_engine import (
     NotificationTestRequest,
     event_engine,
 )
+from backend.journey_engine import (
+    JourneyEngine,
+    JourneyNotFoundError,
+    JourneyStartRequest,
+    LocationFix,
+)
 from backend.risk_engine import (
     EscalationCancelRequest,
     EscalationProcessRequest,
@@ -29,12 +35,14 @@ from backend.risk_engine import (
 )
 
 risk_engine = RiskEngine(event_engine.repository)
+journey_engine = JourneyEngine(event_engine.repository)
 
 
 @asynccontextmanager
 async def lifespan(_app):
     event_engine.initialize()
     risk_engine.initialize()
+    journey_engine.initialize()
     yield
 
 
@@ -188,6 +196,65 @@ def monitoring_state():
         return event_engine.monitoring_state()
     except PersistenceError as exc:
         raise HTTPException(status_code=503, detail="Persistent local storage is unavailable.") from exc
+
+
+@app.post("/api/journeys")
+def start_journey(request: JourneyStartRequest):
+    try:
+        return journey_engine.start(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Journey could not be saved.") from exc
+
+
+@app.get("/api/journeys/active")
+def active_journey():
+    try:
+        return {"journey": journey_engine.active()}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Journey data is unavailable.") from exc
+
+
+@app.get("/api/journeys")
+def journey_history(limit: int = Query(default=20, ge=1, le=100)):
+    try:
+        return {"journeys": journey_engine.history(limit)}
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Journey history is unavailable.") from exc
+
+
+@app.post("/api/journeys/{journey_id}/locations")
+def record_journey_location(journey_id: str, location: LocationFix):
+    try:
+        return journey_engine.record_location(
+            journey_id,
+            location,
+            route_deviation_threshold_meters=(
+                event_engine.config.route_deviation_threshold_meters
+            ),
+            unexpected_stop_threshold_minutes=(
+                event_engine.config.unexpected_stop_threshold_minutes
+            ),
+        )
+    except JourneyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Journey location could not be saved.") from exc
+
+
+@app.post("/api/journeys/{journey_id}/end")
+def end_journey(journey_id: str):
+    try:
+        return journey_engine.end(journey_id)
+    except JourneyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Journey could not be completed.") from exc
 
 
 @app.get("/api/events")
