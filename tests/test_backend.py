@@ -88,7 +88,11 @@ class BackendApiTests(unittest.TestCase):
         response = self.client.get("/api/health")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "healthy")
+        health = response.json()
+        self.assertEqual(health["status"], "healthy")
+        self.assertEqual(health["backend_module"], "backend.main")
+        self.assertGreater(health["process_id"], 0)
+        self.assertIsInstance(health["model_available"], bool)
 
     def test_safety_status_contract_remains_unknown(self):
         response = self.client.get("/api/safety-status")
@@ -944,6 +948,41 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(missing.status_code, 404)
 
+    def test_contacts_delete_and_notification_test_audit_persist(self):
+        created = self.client.post(
+            "/api/contacts",
+            json={"name": "Mummy", "channel": "email", "destination": "mummy@example.org"},
+        ).json()["contact"]
+        edited = self.client.put(
+            f"/api/contacts/{created['id']}",
+            json={"name": "Trusted family", "channel": "sms", "destination": "+15551234567"},
+        )
+        self.assertEqual(edited.status_code, 200, edited.text)
+
+        notification = self.client.post(
+            "/api/notifications/test", json={"contact_id": created["id"]}
+        )
+        self.assertEqual(notification.status_code, 200, notification.text)
+        self.assertEqual(notification.json()["status"], "simulated_not_sent")
+        self.assertFalse(notification.json()["delivery_confirmed"])
+        self.assertFalse(notification.json()["contact_notified"])
+
+        fresh_engine = EventEngine(SQLiteRepository(main.event_engine.repository.db_path))
+        fresh_engine.initialize()
+        self.assertEqual(fresh_engine.redacted_contacts()[0]["name"], "Trusted family")
+        self.assertEqual(fresh_engine.redacted_contacts()[0]["destination_hint"], "***4567")
+        audit = fresh_engine.repository.list_contact_notification_tests()[0]
+        self.assertEqual(audit["id"], notification.json()["test_id"])
+        self.assertEqual(audit["outcome"], "simulated_not_sent")
+
+        deleted = self.client.delete(f"/api/contacts/{created['id']}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(self.client.get("/api/contacts").json()["contacts"], [])
+        self.assertEqual(
+            self.client.delete(f"/api/contacts/{created['id']}").status_code,
+            404,
+        )
+
     def test_risk_assessment_api_contract_and_missing_signals(self):
         response = self.client.post("/api/risk/assessments", json={"demo_mode": True})
 
@@ -956,6 +995,77 @@ class BackendApiTests(unittest.TestCase):
         self.assertTrue(assessment["is_demo"])
         self.assertTrue(assessment["data_quality"]["missing_or_uncertain"])
         self.assertIn("assessment_id", self.client.get("/api/risk/assessments/latest").json())
+
+    def test_demo_assessment_is_saved_and_returned_in_history(self):
+        response = self.client.post(
+            "/api/risk/assessments",
+            json={
+                "demo_mode": True,
+                "vehicle": {"source": "simulated", "stopped_minutes": 12, "reliability": 0.9},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        assessment = response.json()
+
+        history = self.client.get("/api/risk/assessments?limit=10")
+        self.assertEqual(history.status_code, 200, history.text)
+        saved = next(
+            item for item in history.json()["assessments"]
+            if item["assessment_id"] == assessment["assessment_id"]
+        )
+        self.assertEqual(saved["risk_score"], assessment["risk_score"])
+        self.assertEqual(saved["source"], "simulated")
+        self.assertTrue(saved["is_demo"])
+        self.assertTrue(any(signal["status"] == "unknown" for signal in saved["signals_used"]))
+
+    def test_demo_escalation_records_idempotent_mock_transitions(self):
+        assessment = self.client.post(
+            "/api/risk/assessments",
+            json={
+                "demo_mode": True,
+                "gps": {"source": "simulated", "deviation_meters": 1400, "accuracy_meters": 15, "reliability": 0.95},
+                "vehicle": {"source": "simulated", "stopped_minutes": 18, "sudden_braking": True, "reliability": 0.9},
+                "check_in": {"source": "simulated", "responded": False, "overdue_minutes": 25, "reliability": 0.9},
+            },
+        ).json()
+        self.assertEqual(assessment["risk_level"], "critical")
+        assessment_id = assessment["assessment_id"]
+
+        queued = self.client.post(
+            "/api/escalation/demo", json={"assessment_id": assessment_id}
+        )
+        self.assertEqual(queued.status_code, 200, queued.text)
+        queued_again = self.client.post(
+            "/api/escalation/demo", json={"assessment_id": assessment_id}
+        )
+        self.assertTrue(queued_again.json()["idempotent_replay"])
+
+        processed = self.client.post(
+            "/api/escalation/process", json={"assessment_id": assessment_id}
+        )
+        self.assertEqual(processed.status_code, 200, processed.text)
+        self.assertEqual(processed.json()["notification"]["status"], "delivered")
+        self.assertFalse(processed.json()["real_notification_sent"])
+        self.assertTrue(
+            self.client.post(
+                "/api/escalation/process", json={"assessment_id": assessment_id}
+            ).json()["idempotent_replay"]
+        )
+
+        history = self.client.get("/api/escalation/history?limit=20").json()
+        transitions = [
+            item for item in history["history"]
+            if item["assessment_id"] == assessment_id
+        ]
+        self.assertEqual(
+            {item["state"] for item in transitions},
+            {"check_in_required", "escalation_pending", "notified"},
+        )
+        notified = next(item for item in transitions if item["state"] == "notified")
+        self.assertEqual(notified["provider_mode"], "mock")
+        self.assertEqual(notified["delivery_outcome"], "simulated_delivered")
+        self.assertEqual(notified["event_type"], "demo_escalation_delivery")
+        self.assertEqual(len(history["notifications"]), 1)
 
     def test_risk_input_rejects_impossible_sensor_values(self):
         response = self.client.post(

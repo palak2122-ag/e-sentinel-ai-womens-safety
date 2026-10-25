@@ -130,6 +130,7 @@ export default function App() {
   const [discreetMode, setDiscreetMode] = useState(false)
   const [contacts, setContacts] = useState([])
   const [contactsError, setContactsError] = useState('')
+  const [contactNotificationTests, setContactNotificationTests] = useState([])
   const [contactForm, setContactForm] = useState({ name: '', channel: 'email', destination: '' })
   const [editingContactId, setEditingContactId] = useState('')
   const [assistantQuestion, setAssistantQuestion] = useState('Summarize recent events')
@@ -217,6 +218,9 @@ export default function App() {
 
     if (contactResult.status === 'fulfilled' && Array.isArray(contactResult.value.contacts)) {
       setContacts(contactResult.value.contacts)
+      setContactNotificationTests(Array.isArray(contactResult.value.notification_tests)
+        ? contactResult.value.notification_tests
+        : [])
       setContactsError('')
     } else {
       setContactsError(contactResult.status === 'rejected'
@@ -470,7 +474,7 @@ export default function App() {
       setResult(data)
       await refreshWorkspace()
     } catch (err) {
-      setError(`${err.message}. Check that the backend is running on port 8000.`)
+      setError(`${err.message}. Check that the backend is running on port 8002.`)
     } finally {
       setLoading(false)
     }
@@ -489,19 +493,18 @@ export default function App() {
     event.preventDefault()
     runAction('contacts', async () => {
       if (editingContactId) {
-        const result = await api(`/api/contacts/${encodeURIComponent(editingContactId)}`, {
+        await api(`/api/contacts/${encodeURIComponent(editingContactId)}`, {
           method: 'PUT',
           body: JSON.stringify(contactForm),
         })
-        setContacts((current) => current.map((contact) => contact.id === editingContactId ? result.contact : contact))
         setNotificationMessage('Trusted contact updated. Its address remains masked.')
       } else {
-        const result = await api('/api/contacts', { method: 'POST', body: JSON.stringify(contactForm) })
-        setContacts((current) => [...current, result.contact])
-        setNotificationMessage('Trusted contact saved in memory for this backend session; address is redacted.')
+        await api('/api/contacts', { method: 'POST', body: JSON.stringify(contactForm) })
+        setNotificationMessage('Trusted contact saved to local SQLite storage. Its address remains masked.')
       }
       setContactForm({ name: '', channel: 'email', destination: '' })
       setEditingContactId('')
+      await refreshWorkspace()
     })
   }
 
@@ -631,12 +634,34 @@ export default function App() {
   function processPendingEscalation() {
     if (!riskAssessment?.assessment_id) return
     runAction('risk-process', async () => {
+      if (riskAssessment.escalation_state === 'check_in_required') {
+        await api('/api/escalation/demo', {
+          method: 'POST',
+          body: JSON.stringify({ assessment_id: riskAssessment.assessment_id }),
+        })
+      }
       const result = await api('/api/escalation/process', {
         method: 'POST',
         body: JSON.stringify({ assessment_id: riskAssessment.assessment_id }),
       })
-      setNotificationMessage(`Mock escalation state: ${result.state}. No real contact or emergency service was contacted.`)
+      const delivery = result.notification?.status === 'delivered'
+        ? 'simulated delivery recorded'
+        : `provider result: ${result.notification?.status ?? 'not available'}`
+      setNotificationMessage(`Mock escalation: ${delivery}. No real contact or emergency service was contacted.`)
       await refreshWorkspace()
+    })
+  }
+
+  function deleteContact(contact) {
+    if (!window.confirm(`Delete trusted contact "${contact.name}"? This cannot be undone.`)) return
+    runAction('contacts-delete', async () => {
+      await api(`/api/contacts/${encodeURIComponent(contact.id)}`, { method: 'DELETE' })
+      if (editingContactId === contact.id) {
+        setEditingContactId('')
+        setContactForm({ name: '', channel: 'email', destination: '' })
+      }
+      await refreshWorkspace()
+      setNotificationMessage('Trusted contact deleted from local storage.')
     })
   }
 
@@ -646,7 +671,8 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ contact_id: contactId }),
       })
-      setNotificationMessage(result.message)
+      await refreshWorkspace()
+      setNotificationMessage(`${result.status === 'simulated_not_sent' ? 'SIMULATED TEST · NOT SENT' : 'Test result'}: ${result.message}`)
     })
   }
 
@@ -867,7 +893,7 @@ export default function App() {
                 : '▶ Run end-to-end safety demo'}
             </button>
           </div>
-          <div className="discreet-row"><label><input type="checkbox" checked={discreetMode} onChange={(event) => setDiscreetMode(event.target.checked)} /> Discreet check-in controls</label><div className="escalation-actions">{['check_in_required', 'escalation_pending'].includes(riskAssessment?.escalation_state) && <button type="button" disabled={!online || !!busyAction} onClick={respondToRiskCheckIn}>Respond to check-in</button>}{riskAssessment?.escalation_state === 'escalation_pending' && <button type="button" disabled={!online || !!busyAction} onClick={processPendingEscalation}>Run mock escalation</button>}<button type="button" disabled={!online || !!busyAction || !riskAssessment || !['check_in_required', 'escalation_pending'].includes(riskAssessment.escalation_state)} onClick={cancelPendingAssessment}>{discreetMode ? "I'm OK · cancel pending" : 'Cancel pending demo escalation'}</button></div></div>
+          <div className="discreet-row"><label><input type="checkbox" checked={discreetMode} onChange={(event) => setDiscreetMode(event.target.checked)} /> Discreet check-in controls</label><div className="escalation-actions">{['check_in_required', 'escalation_pending'].includes(riskAssessment?.escalation_state) && <button type="button" disabled={!online || !!busyAction} onClick={respondToRiskCheckIn}>Respond to check-in</button>}{riskAssessment?.is_demo && ['high', 'critical'].includes(riskAssessment.risk_level) && ['check_in_required', 'escalation_pending'].includes(riskAssessment.escalation_state) && <button type="button" disabled={!online || !!busyAction} onClick={processPendingEscalation}>{busyAction === 'risk-process' ? 'Running mock escalation...' : 'Run mock escalation'}</button>}<button type="button" disabled={!online || !!busyAction || !riskAssessment || !['check_in_required', 'escalation_pending'].includes(riskAssessment.escalation_state)} onClick={cancelPendingAssessment}>{discreetMode ? "I'm OK · cancel pending" : 'Cancel pending demo escalation'}</button></div></div>
           {riskAssessment?.notification && <p className="notice" role="status">Mock provider: {riskAssessment.notification.status}. {riskAssessment.notification.provider_response?.message} Real contact notification: no.</p>}
         </section>
 
@@ -1136,7 +1162,8 @@ export default function App() {
 
         <section className="panel escalation-panel">
           <div className="panel-title"><div><p className="eyebrow">AUDITABLE STATE MACHINE</p><h2>Escalation and delivery history</h2></div><span className="tag">MOCK PROVIDER ONLY</span></div>
-          {escalations.length === 0 ? <p className="empty-inline">No escalation state changes recorded.</p> : <ol className="timeline-list">{escalations.slice(0, 8).map((record) => <li key={record.id} className="timeline-item"><span className="severity-mark severity-info" aria-hidden="true" /><div className="timeline-copy"><div className="timeline-heading"><strong>{record.state.replaceAll('_', ' ')}</strong><small>{new Date(record.occurred_at).toLocaleString()}</small></div><p>{record.reason}</p>{record.notifications?.map((attempt) => <small key={attempt.id}>Notification: {attempt.status} · {attempt.provider} · no real destination configured</small>)}</div></li>)}</ol>}
+          {escalations.length === 0 ? <p className="empty-inline">No escalation transitions are saved yet. Run a high/critical simulated assessment, then explicitly choose “Run mock escalation”.</p> : <ol className="timeline-list">{escalations.slice(0, 8).map((record) => <li key={record.id} className="timeline-item"><span className="severity-mark severity-info" aria-hidden="true" /><div className="timeline-copy"><div className="timeline-heading"><strong>{record.state.replaceAll('_', ' ')}</strong><small>{formatTimestamp(record.occurred_at)}</small></div><p>{record.reason}</p><small>{record.event_type?.replaceAll('_', ' ') ?? 'risk assessment'} · {record.is_demo ? 'SIMULATED' : 'RECORDED'} · Provider: {record.provider_mode ?? 'not invoked'} · Delivery: {record.delivery_outcome?.replaceAll('_', ' ') ?? 'not attempted'}</small>{record.notifications?.map((attempt) => <small key={attempt.id}>Delivery attempt: {attempt.status === 'delivered' && attempt.provider === 'mock' ? 'simulated success' : attempt.status} · {attempt.provider} · no real destination configured</small>)}</div></li>)}</ol>}
+          {contactNotificationTests.length > 0 && <div className="contact-test-history"><strong>Trusted-contact test audit</strong><ol>{contactNotificationTests.slice(0, 5).map((test) => <li key={test.id}><time>{formatTimestamp(test.attempted_at)}</time><span>SIMULATED · NOT SENT · {test.provider}</span></li>)}</ol></div>}
           <p className="fine-print">Demo mode cannot send to trusted contacts, police, or emergency services. “Notified” refers only to the mock provider's simulated result.</p>
         </section>
 
@@ -1166,10 +1193,10 @@ export default function App() {
         </section>
 
         <section className="panel contacts-panel" id="contacts">
-          <div className="panel-title"><div><p className="eyebrow">USER-CONTROLLED SETTINGS</p><h2>Trusted contacts</h2></div><span className="tag">IN-MEMORY ONLY</span></div>
-          <p className="muted description">Contact entries are held in backend memory for this session only. No message provider is configured.</p>
+          <div className="panel-title"><div><p className="eyebrow">USER-CONTROLLED SETTINGS</p><h2>Trusted contacts</h2></div><span className="tag">LOCAL SQLITE</span></div>
+          <p className="muted description">Contact entries persist in the backend's local SQLite database. Destinations are masked in the UI and are never logged. No message provider is configured.</p>
           {contactsError && <p className="error" role="alert">Trusted contacts unavailable: {contactsError}</p>}
-          {contacts.length === 0 ? <p className="empty-inline">No trusted contacts configured.</p> : <ul className="contact-list">{contacts.map((contact) => <li key={contact.id}><span><strong>{contact.name}</strong><small>{contact.channel.toUpperCase()} · {contact.destination_hint}</small></span><div className="contact-actions"><button type="button" disabled={!!busyAction} onClick={() => editContact(contact)}>Edit</button><button type="button" disabled={!!busyAction} onClick={() => testNotification(contact.id)}>Test mock notification</button></div></li>)}</ul>}
+          {contacts.length === 0 ? <p className="empty-inline">No trusted contacts configured.</p> : <ul className="contact-list">{contacts.map((contact) => <li key={contact.id}><span><strong>{contact.name}</strong><small>{contact.channel.toUpperCase()} · {contact.destination_hint}</small></span><div className="contact-actions"><button type="button" disabled={!!busyAction} onClick={() => editContact(contact)}>Edit</button><button type="button" disabled={!!busyAction} onClick={() => testNotification(contact.id)}>Test mock notification</button><button type="button" disabled={!!busyAction} onClick={() => deleteContact(contact)}>Delete</button></div></li>)}</ul>}
           <form className="contact-form" onSubmit={saveContacts}>
             <label>Name<input required maxLength={80} value={contactForm.name} onChange={(event) => setContactForm({ ...contactForm, name: event.target.value })} /></label>
             <label>Channel<select value={contactForm.channel} onChange={(event) => setContactForm({ ...contactForm, channel: event.target.value })}><option value="email">Email</option><option value="sms">SMS</option></select></label>
@@ -1177,7 +1204,7 @@ export default function App() {
             <button className="primary" disabled={!online || !!busyAction}>{editingContactId ? 'Update contact' : 'Save contact'}</button>
             {editingContactId && <button className="cancel-edit" type="button" onClick={() => { setEditingContactId(''); setContactForm({ name: '', channel: 'email', destination: '' }) }}>Cancel edit</button>}
           </form>
-          <p className="fine-print">Test mode confirms the UI workflow only. It never sends email or SMS and never reports delivery.</p>
+          <p className="fine-print">A test click records a simulated test outcome in SQLite, but sends no email or SMS and never reports confirmed delivery.</p>
         </section>
 
         <section className="sos-panel" id="emergency">

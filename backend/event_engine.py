@@ -68,6 +68,7 @@ class EventEngine:
         config = self.repository.load_config()
         check_in = self.repository.load_check_in()
         last_peak = self.repository.load_last_cabin_peak()
+        contacts = self.repository.list_contacts()
         with self._lock:
             if config is not None:
                 self.config = MonitoringConfig.model_validate(config)
@@ -75,6 +76,7 @@ class EventEngine:
                 self.check_in_status = check_in["status"]
                 self.checked_in_at = check_in["occurred_at"]
             self.last_cabin_peak = last_peak
+            self.contacts = contacts
 
     @staticmethod
     def _now() -> str:
@@ -308,25 +310,21 @@ class EventEngine:
                 "destination": destination,
             })
         with self._lock:
-            self.contacts = normalized
+            self.contacts = self.repository.replace_contacts(normalized)
             return self.redacted_contacts()
 
     def add_contact(self, contact: ContactInput) -> dict:
-        if not contact.name.strip() or not contact.destination.strip():
-            raise ValueError("Contact name and destination cannot be blank.")
-        current = self.set_contacts(
-            [
-                ContactInput(
-                    name=item["name"],
-                    channel=item["channel"],
-                    destination=item["destination"],
-                )
-                for item in self.contacts
-            ] + [contact]
-        )
-        return current[-1]
+        normalized = self._normalize_contact(contact)
+        with self._lock:
+            saved = self.repository.add_contact({
+                **normalized,
+                "id": str(uuid4()),
+            })
+            self.contacts = self.repository.list_contacts()
+            return self._redact_contact(saved)
 
-    def update_contact(self, contact_id: str, contact: ContactInput) -> dict:
+    @staticmethod
+    def _normalize_contact(contact: ContactInput) -> dict:
         name = contact.name.strip()
         destination = contact.destination.strip()
         if not name or not destination:
@@ -335,22 +333,31 @@ class EventEngine:
             raise ValueError("Enter a valid email address for the contact.")
         if contact.channel == "sms" and sum(character.isdigit() for character in destination) < 7:
             raise ValueError("Enter a phone number with at least 7 digits for the contact.")
+        return {"name": name, "channel": contact.channel, "destination": destination}
 
+    @staticmethod
+    def _redact_contact(contact: dict) -> dict:
+        return {
+            "id": contact["id"],
+            "name": contact["name"],
+            "channel": contact["channel"],
+            "destination_hint": "***" + contact["destination"][-4:],
+        }
+
+    def update_contact(self, contact_id: str, contact: ContactInput) -> dict:
+        normalized = self._normalize_contact(contact)
         with self._lock:
-            existing = next((item for item in self.contacts if item["id"] == contact_id), None)
-            if existing is None:
+            saved = self.repository.update_contact(contact_id, normalized)
+            if saved is None:
                 raise LookupError("Trusted contact was not found.")
-            existing.update({
-                "name": name,
-                "channel": contact.channel,
-                "destination": destination,
-            })
-            return {
-                "id": existing["id"],
-                "name": existing["name"],
-                "channel": existing["channel"],
-                "destination_hint": "***" + existing["destination"][-4:],
-            }
+            self.contacts = self.repository.list_contacts()
+            return self._redact_contact(saved)
+
+    def delete_contact(self, contact_id: str) -> None:
+        with self._lock:
+            if not self.repository.delete_contact(contact_id):
+                raise LookupError("Trusted contact was not found.")
+            self.contacts = self.repository.list_contacts()
 
     def check_in(self) -> dict:
         checked_in_at = self._now()
@@ -372,30 +379,27 @@ class EventEngine:
 
     def redacted_contacts(self) -> list[dict]:
         with self._lock:
-            return [
-                {
-                    "id": contact["id"],
-                    "name": contact["name"],
-                    "channel": contact["channel"],
-                    "destination_hint": "***" + contact["destination"][-4:],
-                }
-                for contact in self.contacts
-            ]
+            self.contacts = self.repository.list_contacts()
+            return [self._redact_contact(contact) for contact in self.contacts]
 
     def test_notification(self, contact_id: str | None) -> dict:
         with self._lock:
-            known = contact_id is None or any(
-                contact["id"] == contact_id for contact in self.contacts
+            if contact_id is not None and not any(
+                contact["id"] == contact_id for contact in self.repository.list_contacts()
+            ):
+                raise LookupError("Trusted contact was not found.")
+            result = {
+                "status": "simulated_not_sent",
+                "provider": "mock",
+                "provider_configured": False,
+                "delivery_confirmed": False,
+                "contact_notified": False,
+                "message": "Simulated test recorded; no email, SMS, contact, or emergency service was contacted.",
+            }
+            audit = self.repository.save_contact_notification_test(
+                contact_id, "mock", result["status"], result
             )
-        if not known:
-            raise ValueError("Trusted contact was not found.")
-        return {
-            "status": "test_only",
-            "provider_configured": False,
-            "delivery_confirmed": False,
-            "contact_notified": False,
-            "message": "Test mode only: no email, SMS, contact, or emergency service was contacted.",
-        }
+        return {**result, "test_id": audit["id"], "attempted_at": audit["attempted_at"]}
 
 
 event_engine = EventEngine()
