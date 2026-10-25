@@ -918,6 +918,32 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("a@example.org", str(listed))
         self.assertNotIn("+15551234567", str(listed))
 
+    def test_contact_can_be_updated_without_exposing_destination(self):
+        created = self.client.post(
+            "/api/contacts",
+            json={"name": "Trusted", "channel": "email", "destination": "old@example.org"},
+        ).json()["contact"]
+
+        response = self.client.put(
+            f"/api/contacts/{created['id']}",
+            json={"name": "Updated trusted", "channel": "sms", "destination": "+15551234567"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        updated = response.json()["contact"]
+        self.assertEqual(updated["id"], created["id"])
+        self.assertEqual(updated["name"], "Updated trusted")
+        self.assertEqual(updated["channel"], "sms")
+        self.assertEqual(updated["destination_hint"], "***4567")
+        self.assertNotIn("+15551234567", response.text)
+        self.assertEqual(self.client.get("/api/contacts").json()["contacts"], [updated])
+
+        missing = self.client.put(
+            "/api/contacts/not-a-contact",
+            json={"name": "Nobody", "channel": "email", "destination": "nobody@example.org"},
+        )
+        self.assertEqual(missing.status_code, 404)
+
     def test_risk_assessment_api_contract_and_missing_signals(self):
         response = self.client.post("/api/risk/assessments", json={"demo_mode": True})
 

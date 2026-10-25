@@ -431,6 +431,17 @@ def add_trusted_contact(contact: ContactInput):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.put("/api/contacts/{contact_id}")
+def update_trusted_contact(contact_id: str, contact: ContactInput):
+    try:
+        updated_contact = event_engine.update_contact(contact_id, contact)
+        return {"contact": updated_contact, "storage": "in_memory_only"}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/api/monitoring/check-in")
 def simulate_check_in():
     try:

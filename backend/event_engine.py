@@ -326,6 +326,32 @@ class EventEngine:
         )
         return current[-1]
 
+    def update_contact(self, contact_id: str, contact: ContactInput) -> dict:
+        name = contact.name.strip()
+        destination = contact.destination.strip()
+        if not name or not destination:
+            raise ValueError("Contact name and destination cannot be blank.")
+        if contact.channel == "email" and ("@" not in destination or "." not in destination.split("@")[-1]):
+            raise ValueError("Enter a valid email address for the contact.")
+        if contact.channel == "sms" and sum(character.isdigit() for character in destination) < 7:
+            raise ValueError("Enter a phone number with at least 7 digits for the contact.")
+
+        with self._lock:
+            existing = next((item for item in self.contacts if item["id"] == contact_id), None)
+            if existing is None:
+                raise LookupError("Trusted contact was not found.")
+            existing.update({
+                "name": name,
+                "channel": contact.channel,
+                "destination": destination,
+            })
+            return {
+                "id": existing["id"],
+                "name": existing["name"],
+                "channel": existing["channel"],
+                "destination_hint": "***" + existing["destination"][-4:],
+            }
+
     def check_in(self) -> dict:
         checked_in_at = self._now()
         self.repository.save_check_in(checked_in_at, "simulated_checked_in")

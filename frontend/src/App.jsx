@@ -60,6 +60,33 @@ function eventSourceLabel(event) {
   return event.source?.replaceAll('_', ' ').toUpperCase() ?? 'RECORDED'
 }
 
+function signalAvailability(signal) {
+  if (signal?.available === false || signal?.status === 'unavailable' || signal?.status === 'not_available') return 'UNAVAILABLE'
+  if (!signal || signal.source === 'unknown' || signal.status === 'unknown') return 'UNKNOWN'
+  if (signal.source === 'simulated') return 'SIMULATED'
+  return 'AVAILABLE'
+}
+
+function formatTimestamp(timestamp) {
+  if (!timestamp) return 'Not available'
+  const date = new Date(timestamp)
+  return Number.isNaN(date.getTime()) ? 'Not available' : date.toLocaleString()
+}
+
+function greetingForTime() {
+  const hour = new Date().getHours()
+  if (hour < 12) return 'Good morning'
+  if (hour < 18) return 'Good afternoon'
+  return 'Good evening'
+}
+
+const assistantSuggestions = [
+  'Why was this risk score generated?',
+  'Summarize the latest events.',
+  'Which signals are unavailable?',
+  'What should I check next?',
+]
+
 function locationAccuracyNotice(journey, routeDeviationThreshold) {
   if (!journey) return null
 
@@ -104,11 +131,18 @@ export default function App() {
   const [contacts, setContacts] = useState([])
   const [contactsError, setContactsError] = useState('')
   const [contactForm, setContactForm] = useState({ name: '', channel: 'email', destination: '' })
+  const [editingContactId, setEditingContactId] = useState('')
   const [assistantQuestion, setAssistantQuestion] = useState('Summarize recent events')
   const [assistantAnswer, setAssistantAnswer] = useState(null)
   const [notificationMessage, setNotificationMessage] = useState('')
   const [actionError, setActionError] = useState('')
   const [busyAction, setBusyAction] = useState('')
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [activeNav, setActiveNav] = useState('overview')
+  const [eventSeverityFilter, setEventSeverityFilter] = useState('all')
+  const [eventTypeFilter, setEventTypeFilter] = useState('all')
+  const [eventSourceFilter, setEventSourceFilter] = useState('all')
+  const [eventSearch, setEventSearch] = useState('')
   const fileRef = useRef(null)
   const locationWatchRef = useRef(null)
   const locationRequestInFlightRef = useRef(false)
@@ -118,6 +152,31 @@ export default function App() {
     activeJourney,
     journey?.configuration?.route_deviation_threshold_meters ?? 500,
   )
+  const visibleEvents = events.filter((event) => {
+    const matchesSeverity = eventSeverityFilter === 'all' || event.severity === eventSeverityFilter
+    const matchesType = eventTypeFilter === 'all' || event.event_type === eventTypeFilter
+    const matchesSource = eventSourceFilter === 'all'
+      || (event.is_demo ? 'simulated' : 'recorded') === eventSourceFilter
+    const searchText = `${event.event_type} ${event.observed_fact} ${eventSourceLabel(event)}`.toLowerCase()
+    return matchesSeverity && matchesType && matchesSource && searchText.includes(eventSearch.trim().toLowerCase())
+  })
+  const riskScore = riskAssessment?.risk_score
+  const latestAssessmentSignals = riskAssessment?.signals_used ?? []
+  const signalCards = [
+    { name: 'Camera', icon: '◫', key: 'camera' },
+    { name: 'GPS', icon: '⌖', key: 'gps' },
+    { name: 'Vehicle signals', icon: '◈', key: 'vehicle' },
+    { name: 'Passenger check-in', icon: '◉', key: 'check_in' },
+  ].map((item) => ({
+    ...item,
+    signal: latestAssessmentSignals.find((signal) => signal.name === item.key),
+  }))
+  const trendAssessments = riskHistory.slice(0, 8).reverse()
+  const journeyStartedAt = Date.parse(activeJourney?.started_at ?? '')
+  const latestJourneyFixAt = Date.parse(activeJourney?.current_location?.observed_at ?? '')
+  const journeyDurationMinutes = Number.isFinite(journeyStartedAt) && Number.isFinite(latestJourneyFixAt)
+    ? Math.max(0, Math.floor((latestJourneyFixAt - journeyStartedAt) / 60000))
+    : null
 
   async function refreshWorkspace() {
     const [
@@ -373,6 +432,7 @@ export default function App() {
 
   function endJourney() {
     if (!activeJourney) return
+    if (!window.confirm('End this journey and stop browser location monitoring?')) return
     runAction('journey-end', async () => {
       if (locationWatchRef.current !== null && navigator.geolocation) {
         navigator.geolocation.clearWatch(locationWatchRef.current)
@@ -428,11 +488,26 @@ export default function App() {
   function saveContacts(event) {
     event.preventDefault()
     runAction('contacts', async () => {
-      const result = await api('/api/contacts', { method: 'POST', body: JSON.stringify(contactForm) })
-      setContacts((current) => [...current, result.contact])
+      if (editingContactId) {
+        const result = await api(`/api/contacts/${encodeURIComponent(editingContactId)}`, {
+          method: 'PUT',
+          body: JSON.stringify(contactForm),
+        })
+        setContacts((current) => current.map((contact) => contact.id === editingContactId ? result.contact : contact))
+        setNotificationMessage('Trusted contact updated. Its address remains masked.')
+      } else {
+        const result = await api('/api/contacts', { method: 'POST', body: JSON.stringify(contactForm) })
+        setContacts((current) => [...current, result.contact])
+        setNotificationMessage('Trusted contact saved in memory for this backend session; address is redacted.')
+      }
       setContactForm({ name: '', channel: 'email', destination: '' })
-      setNotificationMessage('Trusted contact saved in memory for this backend session; address is redacted.')
+      setEditingContactId('')
     })
+  }
+
+  function editContact(contact) {
+    setEditingContactId(contact.id)
+    setContactForm({ name: contact.name, channel: contact.channel, destination: '' })
   }
 
   function saveThresholds(event) {
@@ -456,6 +531,54 @@ export default function App() {
       await api('/api/monitoring/check-in', { method: 'POST' })
       await refreshWorkspace()
       setNotificationMessage('Simulated passenger check-in recorded; no location was shared.')
+    })
+  }
+
+  function runEndToEndDemo() {
+    runAction('end-to-end-demo', async () => {
+      // Step 1: Record a simulated journey event.
+      await api('/api/events/demo', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_type: 'route_deviation',
+          route_deviation_meters:
+            (journey?.configuration?.route_deviation_threshold_meters ?? 500) + 200,
+        }),
+      })
+
+      // Step 2: Assess a corroborated, explicitly simulated scenario.
+      const assessment = await api('/api/risk/assessments', {
+        method: 'POST',
+        body: JSON.stringify({
+          demo_mode: true,
+          gps: {
+            source: 'simulated',
+            deviation_meters: 1400,
+            accuracy_meters: 15,
+            reliability: 0.95,
+          },
+          vehicle: {
+            source: 'simulated',
+            stopped_minutes: 18,
+            sudden_braking: true,
+            reliability: 0.9,
+          },
+          check_in: {
+            source: 'simulated',
+            responded: false,
+            overdue_minutes: 25,
+            reliability: 0.9,
+          },
+        }),
+      })
+
+      // Step 3: Show the resulting assessment and reload saved history.
+      setRiskAssessment(assessment)
+      await refreshWorkspace()
+
+      setNotificationMessage(
+        `End-to-end demo completed: ${assessment.risk_level.toUpperCase()} risk (${assessment.risk_score}/100). Simulated event and assessment submitted. No real contacts or emergency services were contacted.`,
+      )
     })
   }
 
@@ -529,46 +652,79 @@ export default function App() {
 
   function askAssistant(event) {
     event.preventDefault()
+    submitAssistantQuestion(assistantQuestion)
+  }
+
+  function submitAssistantQuestion(question) {
     runAction('assistant', async () => {
       const result = await api('/api/assistant/query', {
         method: 'POST',
-        body: JSON.stringify({ question: assistantQuestion }),
+        body: JSON.stringify({ question }),
       })
       setAssistantAnswer(result)
     })
   }
 
   function resetEvents() {
+    if (!window.confirm('Reset simulated events and demo risk history? Recorded non-demo events will be preserved.')) return
     runAction('reset', async () => {
       await api('/api/events/demo', { method: 'DELETE' })
       setSos(false)
       setAssistantAnswer(null)
       await refreshWorkspace()
+      setNotificationMessage('Simulated events and demo assessments were reset. Recorded non-demo events were preserved.')
     })
   }
 
   return (
-    <div className="app">
-      <aside className="sidebar">
+    <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+      <aside className="sidebar" aria-label="Main navigation">
         <div className="brand">
-          <div className="logo">S</div>
+          <div className="logo" aria-hidden="true">S</div>
           <div>
             <strong>e-Sentinel AI</strong>
             <small>WOMEN'S JOURNEY SAFETY</small>
           </div>
+          <button
+            className="sidebar-toggle"
+            type="button"
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!sidebarCollapsed}
+            onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+          >
+            {sidebarCollapsed ? '»' : '«'}
+          </button>
         </div>
 
         <p className="nav-title">WORKSPACE</p>
-        <a className="nav active" href="#overview">▦ &nbsp; Overview</a>
-        <a className="nav" href="#journey">⌖ &nbsp; Journey monitor</a>
-        <a className="nav" href="#cabin">▣ &nbsp; Cabin analysis</a>
-        <a className="nav" href="#timeline">◷ &nbsp; Event timeline</a>
-        <a className="nav" href="#contacts">♡ &nbsp; Trusted contacts</a>
-        <a className="nav" href="#assistant">✳ &nbsp; Local assistant</a>
-        <a className="nav" href="#emergency">! &nbsp; Emergency SOS</a>
+        <nav className="workspace-nav">
+          {[
+            ['overview', '▦', 'Overview'],
+            ['journey', '⌖', 'Journey monitor'],
+            ['cabin', '◫', 'Cabin vision'],
+            ['timeline', '◷', 'Event timeline'],
+            ['risk-history', '⌁', 'Risk history'],
+            ['contacts', '♡', 'Trusted contacts'],
+            ['assistant', '✳', 'Local assistant'],
+            ['settings', '⚙', 'Settings'],
+            ['emergency', '!', 'Emergency SOS'],
+          ].map(([section, icon, label]) => (
+            <a
+              key={section}
+              className={`nav ${activeNav === section ? 'active' : ''}`}
+              href={`#${section}`}
+              aria-current={activeNav === section ? 'page' : undefined}
+              onClick={() => setActiveNav(section)}
+              title={sidebarCollapsed ? label : undefined}
+            >
+              <span className="nav-icon" aria-hidden="true">{icon}</span>
+              <span className="nav-label">{label}</span>
+            </a>
+          ))}
+        </nav>
 
         <div className="privacy">
-          <span>✳</span>
+          <span aria-hidden="true">✳</span>
           <strong>Privacy-first demo</strong>
           <p>Cabin videos are processed by your local backend and are not uploaded to a cloud service by this app.</p>
           <small>PROTOTYPE · v0.2.0</small>
@@ -578,74 +734,147 @@ export default function App() {
       <main className="main">
         <header className="header" id="overview">
           <div>
-            <p className="eyebrow">SAFETY WORKSPACE / OVERVIEW</p>
-            <h1>Journey safety dashboard</h1>
-            <p className="muted">Monitor demo signals and analyze cabin footage.</p>
+            <p className="eyebrow">E-SENTINEL / COMMAND CENTER</p>
+            <h1>Safety overview</h1>
+            <p className="muted">Your safety, intelligently monitored.</p>
           </div>
           <div className="header-indicators">
-            <span className="mode-badge">LOCAL DEMO</span>
+            <span className="mode-badge">DEMO MODE</span>
             <div className="connection" role="status" aria-live="polite">
               <span className={`dot ${online ? 'green' : ''}`} />
-              {online ? 'Systems connected' : 'Backend offline'}
+              {online ? 'Backend connected' : 'Backend offline'}
             </div>
+            {!online && <button type="button" className="retry-button" onClick={() => runAction('refresh', refreshWorkspace)}>Retry connection</button>}
           </div>
         </header>
 
         <section className="hero">
-          <div className="eyebrow">E-SENTINEL MONITOR</div>
-          <h2>Journey monitoring, with clear evidence.</h2>
-          <p>Local video analysis · opted-in browser GPS · user-controlled alerts</p>
-          <div className="hero-symbol">✳</div>
+          <div className="hero-copy">
+            <div className="eyebrow">SAFETY WORKSPACE · LOCAL SESSION</div>
+            <h2>{greetingForTime()}</h2>
+            <p>Your safety, intelligently monitored.</p>
+            <div className="hero-status">
+              <span className={`status-indicator ${activeJourney?.status === 'active' ? 'is-active' : ''}`} />
+              {activeJourney?.status === 'active' ? 'Journey monitoring active' : 'No active journey'}
+              <span className="demo-chip">SIMULATED DATA CLEARLY LABELLED</span>
+            </div>
+          </div>
+          <div className="hero-symbol" aria-hidden="true">✳</div>
         </section>
 
         <section className="stats">
-          <article className="card">
-            <p>Backend status</p>
-            <h3 className={online ? 'green-text' : ''}>{online ? 'Online' : 'Offline'}</h3>
-            <small>FastAPI health check</small>
+          <article className={`card metric-card ${!workspaceLoaded ? 'loading-skeleton' : ''}`}>
+            <div className="metric-heading"><span className="metric-icon violet" aria-hidden="true">◉</span><span>Backend connection</span></div>
+            <h3 className={online ? 'green-text' : 'coral-text'}>{workspaceLoaded ? (online ? 'Connected' : 'Offline') : 'Loading'}</h3>
+            <small>{online ? 'Local API responding' : 'Retry when the backend is available'}</small>
           </article>
-          <article className="card">
-            <p>Frames processed</p>
-            <h3>{result?.frames_processed ?? '—'}</h3>
-            <small>Latest cabin video</small>
+          <article className={`card metric-card ${!workspaceLoaded ? 'loading-skeleton' : ''}`}>
+            <div className="metric-heading"><span className="metric-icon turquoise" aria-hidden="true">⌖</span><span>Current journey</span></div>
+            <h3>{activeJourney?.status === 'active' ? 'Monitoring' : (workspaceLoaded ? 'Not active' : 'Loading')}</h3>
+            <small>{activeJourney?.destination ?? 'Start a journey when you are ready'}</small>
           </article>
-          <article className="card">
-            <p>Peak frame detections</p>
-            <h3>{result?.maximum_people_in_one_frame ?? '—'}</h3>
-            <small>Maximum in one frame</small>
+          <article className={`card metric-card ${!workspaceLoaded ? 'loading-skeleton' : ''}`}>
+            <div className="metric-heading"><span className="metric-icon coral" aria-hidden="true">⌁</span><span>Latest risk score</span></div>
+            <h3 className="risk-metric">{riskScore != null ? `${riskScore}/100` : (workspaceLoaded ? 'Not available' : 'Loading')}</h3>
+            <small>{riskAssessment ? `${riskAssessment.risk_level.toUpperCase()} · ${riskAssessment.source?.toUpperCase() ?? 'UNKNOWN'} source` : 'Not analyzed yet'}</small>
           </article>
-          <article className="card">
-            <p>Rule-based risk score</p>
-            <h3 className="amber-text">{riskAssessment ? `${riskAssessment.risk_score}/100` : '—'}</h3>
-            <small>{riskAssessment ? `${riskAssessment.risk_level.toUpperCase()} · ${riskAssessment.source?.toUpperCase() ?? 'UNKNOWN'} source` : 'No assessment yet'}</small>
+          <article className={`card metric-card ${!workspaceLoaded ? 'loading-skeleton' : ''}`}>
+            <div className="metric-heading"><span className="metric-icon amber" aria-hidden="true">▣</span><span>Cabin frames processed</span></div>
+            <h3>{result?.frames_processed ?? (workspaceLoaded ? 'Not analyzed yet' : 'Loading')}</h3>
+            <small>{result ? `${result.total_person_detections_across_frames} frame-level detections in latest analysis` : 'No cabin video analysis in this view'}</small>
           </article>
         </section>
 
         <section className="risk-panel panel" aria-labelledby="risk-title">
-          <div className="panel-title"><div><p className="eyebrow">MULTI-SIGNAL RULE ENGINE</p><h2 id="risk-title">Current assessment</h2></div><span className={`risk-pill risk-${riskAssessment?.risk_level ?? 'unknown'}`}>{riskAssessment?.risk_level?.toUpperCase() ?? 'UNKNOWN'}</span></div>
+          <div className="panel-title">
+            <div><p className="eyebrow">MULTI-SIGNAL RULE ENGINE</p><h2 id="risk-title">Risk intelligence</h2></div>
+            <span className={`risk-pill risk-${riskAssessment?.risk_level ?? 'unknown'}`}>{riskAssessment?.risk_level?.toUpperCase() ?? 'UNKNOWN'}</span>
+          </div>
           {riskError && <p className="error" role="alert">Risk data unavailable: {riskError}</p>}
-          {!riskAssessment ? <p className="empty-inline">No assessment available. Inputs not submitted are unknown, never treated as safe.</p> : <>
-            <div className="risk-score-row"><strong>{riskAssessment.risk_score}</strong><span>/ 100 · prototype rule score</span><small>{riskAssessment.source?.toUpperCase()}</small></div>
-            <div className="signal-cards">
-              {riskAssessment.signals_used.map((signal) => <div className="signal-card" key={signal.name}><span>{signal.name.replaceAll('_', ' ')}</span><b className={`source-${signal.source}`}>{signal.source.toUpperCase()}</b><small>{signal.status}{signal.reliability != null ? ` · reliability ${Math.round(signal.reliability * 100)}%` : ''}</small></div>)}
+          {!riskAssessment ? <p className="empty-inline">{riskError ? 'Risk assessment could not be loaded.' : 'No assessment available. Run a labelled scenario to see a rule-based assessment.'} Inputs not submitted are unknown, never treated as safe.</p> : <>
+            <div className="risk-summary">
+              <div
+                className={`risk-gauge risk-${riskAssessment.risk_level}`}
+                style={{ '--risk-score': `${Math.max(0, Math.min(100, riskAssessment.risk_score)) * 3.6}deg` }}
+                role="img"
+                aria-label={`Risk score ${riskAssessment.risk_score} out of 100`}
+              >
+                <div><strong>{riskAssessment.risk_score}</strong><span>/ 100</span></div>
+              </div>
+              <div className="risk-summary-copy">
+                <span className={`risk-pill risk-${riskAssessment.risk_level}`}>{riskAssessment.risk_level.toUpperCase()} RISK</span>
+                <h3>Assessment overview</h3>
+                <p>{riskAssessment.recommended_action}</p>
+                <div className="risk-meta">
+                  <span>◷ {formatTimestamp(riskAssessment.timestamp)}</span>
+                  <span>Source: {riskAssessment.source?.toUpperCase() ?? 'UNKNOWN'}</span>
+                  <span>{riskAssessment.data_quality?.corroborating_signal_count ?? 0} corroborating signals</span>
+                </div>
+              </div>
             </div>
-            <div className="risk-details"><div><strong>Reasons</strong>{riskAssessment.reasons.map((reason, index) => <p key={`${reason.signal}-${index}`}>{reason.explanation} {reason.points > 0 ? `(+${reason.points})` : ''}</p>)}</div><div><strong>Data quality</strong>{riskAssessment.data_quality.missing_or_uncertain.length ? <ul>{riskAssessment.data_quality.missing_or_uncertain.map((item) => <li key={item}>{item}</li>)}</ul> : <p>No missing signals reported.</p>}</div></div>
-            <p className="risk-action"><strong>Recommended:</strong> {riskAssessment.recommended_action}</p>
+            <div className="risk-details">
+              <div className="risk-factors">
+                <strong>Contributing factors</strong>
+                {(riskAssessment.reasons ?? []).filter((reason) => reason.signal !== 'scoring').length === 0
+                  ? <p>No contributing factors were returned for this assessment.</p>
+                  : (riskAssessment.reasons ?? []).filter((reason) => reason.signal !== 'scoring').map((reason, index) => (
+                    <div className="factor-row" key={`${reason.signal}-${index}`}>
+                      <span><b>{reason.signal.replaceAll('_', ' ')}</b><small>{reason.explanation}</small></span>
+                      <strong className={reason.points > 0 ? 'factor-points' : ''}>{reason.points > 0 ? `+${reason.points}` : `${reason.points ?? 0}`} pts</strong>
+                    </div>
+                  ))}
+              </div>
+              <div>
+                <strong>Data quality</strong>
+                <p className="quality-count">{riskAssessment.data_quality?.missing_or_uncertain?.length
+                  ? `${riskAssessment.data_quality.missing_or_uncertain.length} signal quality concern(s)`
+                  : 'No missing signals reported.'}</p>
+                {riskAssessment.data_quality?.missing_or_uncertain?.length
+                  ? <ul>{riskAssessment.data_quality.missing_or_uncertain.map((item) => <li key={item}>{item}</li>)}</ul>
+                  : <p>Only supplied observations are represented. Unknown is not safe.</p>}
+              </div>
+            </div>
+            <p className="risk-action"><strong>Recommended next action</strong>{riskAssessment.recommended_action}</p>
             <p className="risk-unknown-notice">Unknown signals are not evidence of safety. This score describes only the supplied observations.</p>
-            <p className="fine-print">{riskAssessment.disclaimer}</p>
+            <p className="fine-print">{riskAssessment.disclaimer} The prototype's rule score is not a probability of harm.</p>
           </>}
+          <div className="signal-quality">
+            <div className="subsection-heading"><div><strong>Signal quality</strong><small>Status is scoped to the latest returned assessment.</small></div><span className="tag">4 SIGNALS</span></div>
+            <div className="signal-cards">
+              {signalCards.map(({ name, icon, key, signal }) => (
+                <article className="signal-card" key={key}>
+                  <span className="signal-card-icon" aria-hidden="true">{icon}</span>
+                  <div><strong>{name}</strong><b className={`availability availability-${signalAvailability(signal).toLowerCase()}`}>{signalAvailability(signal)}</b></div>
+                  <small>{signal?.reliability != null ? `Reliability ${Math.round(signal.reliability * 100)}%` : 'Reliability not provided'}</small>
+                </article>
+              ))}
+            </div>
+          </div>
           <div className="risk-demo-controls" aria-label="Simulated risk scenarios">
-            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('route')}>Simulate route deviation</button>
-            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('stop')}>Simulate prolonged stop</button>
-            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('combined')}>Simulate corroborated critical</button>
-            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('unknown')}>Simulate camera unavailable</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('route')}>SIMULATED · Route deviation</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('stop')}>SIMULATED · Prolonged stop</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => toggleJourneyEvent('missedCheckIn')}>SIMULATED · Missed check-in</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('combined')}>SIMULATED · Corroborated critical</button>
+            <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('unknown')}>SIMULATED · Camera unavailable</button>
+            <button
+              type="button"
+              className="primary"
+              disabled={!online || !!busyAction}
+              onClick={runEndToEndDemo}
+            >
+              {busyAction === 'end-to-end-demo'
+                ? 'Running safety workflow...'
+                : '▶ Run end-to-end safety demo'}
+            </button>
           </div>
           <div className="discreet-row"><label><input type="checkbox" checked={discreetMode} onChange={(event) => setDiscreetMode(event.target.checked)} /> Discreet check-in controls</label><div className="escalation-actions">{['check_in_required', 'escalation_pending'].includes(riskAssessment?.escalation_state) && <button type="button" disabled={!online || !!busyAction} onClick={respondToRiskCheckIn}>Respond to check-in</button>}{riskAssessment?.escalation_state === 'escalation_pending' && <button type="button" disabled={!online || !!busyAction} onClick={processPendingEscalation}>Run mock escalation</button>}<button type="button" disabled={!online || !!busyAction || !riskAssessment || !['check_in_required', 'escalation_pending'].includes(riskAssessment.escalation_state)} onClick={cancelPendingAssessment}>{discreetMode ? "I'm OK · cancel pending" : 'Cancel pending demo escalation'}</button></div></div>
           {riskAssessment?.notification && <p className="notice" role="status">Mock provider: {riskAssessment.notification.status}. {riskAssessment.notification.provider_response?.message} Real contact notification: no.</p>}
         </section>
 
-        {actionError && <p className="error" role="alert">{actionError}</p>}
-        {notificationMessage && <p className="notice" role="status" aria-live="polite">{notificationMessage}</p>}
+        <div className="toast-stack" aria-live="polite">
+          {actionError && <p className="error" role="alert">{actionError}</p>}
+          {notificationMessage && <p className="notice" role="status" aria-live="polite">{notificationMessage}</p>}
+        </div>
 
         <section className="columns">
           <article className="panel map-panel" id="journey">
@@ -660,19 +889,25 @@ export default function App() {
             </p>
             {activeJourney?.status === 'active' ? (
               <>
+                <ol className="journey-progress" aria-label="Journey progress">
+                  <li className="complete"><span>1</span>Started</li>
+                  <li className={locationMonitoring ? 'complete' : 'current'}><span>2</span>Monitoring</li>
+                  <li><span>3</span>Completed</li>
+                </ol>
                 <div className="live-location-card" aria-live="polite">
                   <div className="live-location-heading"><strong>Current device location</strong><span>{locationMonitoring ? 'MONITORING' : 'PAUSED'}</span></div>
                   <p>{activeJourney.current_location.latitude.toFixed(5)}, {activeJourney.current_location.longitude.toFixed(5)}</p>
-                  <small>Accuracy ±{Math.round(activeJourney.current_location.accuracy_meters)} m · Updated {new Date(activeJourney.current_location.observed_at).toLocaleString()}</small>
+                  <small>Accuracy ±{Math.round(activeJourney.current_location.accuracy_meters)} m · Updated {formatTimestamp(activeJourney.current_location.observed_at)}</small>
                 </div>
                 {gpsAccuracyNotice && (
-                  <p className="fine-print" role="status">
+                  <p className="accuracy-warning" role="status">
                     {gpsAccuracyNotice}
                   </p>
                 )}
                 <div className="journey-details">
                   <div><span>Status</span><strong>{activeJourney.status}</strong></div>
-                  <div><span>Started</span><strong>{new Date(activeJourney.started_at).toLocaleString()}</strong></div>
+                  <div><span>Started</span><strong>{formatTimestamp(activeJourney.started_at)}</strong></div>
+                  <div><span>Recorded duration</span><strong>{journeyDurationMinutes == null ? 'Not available' : `${journeyDurationMinutes} min through latest GPS fix`}</strong></div>
                   <div><span>Start</span><strong>{activeJourney.start_location.latitude.toFixed(5)}, {activeJourney.start_location.longitude.toFixed(5)}</strong></div>
                   <div><span>Destination</span><strong>{activeJourney.destination}</strong></div>
                   <div><span>Planned route</span><strong>{activeJourney.planned_route.length >= 2 ? `${activeJourney.planned_route.length} user-supplied waypoints` : 'Not supplied'}</strong></div>
@@ -750,7 +985,7 @@ export default function App() {
               <button type="button" disabled={!online || !!busyAction} onClick={() => toggleJourneyEvent('missedCheckIn')}>Simulate missed check-in</button>
               <button type="button" className="reset-control" disabled={!online || !!busyAction} onClick={resetEvents}>Reset demo events</button>
             </div>
-            {thresholds && <form className="threshold-form" onSubmit={saveThresholds}>
+            {thresholds && <form className="threshold-form" id="settings" onSubmit={saveThresholds}>
               <strong>Explainable demo thresholds</strong>
               <label>Route offset (m)<input type="number" min="50" max="10000" value={thresholds.route_deviation_threshold_meters} onChange={(event) => setThresholds({ ...thresholds, route_deviation_threshold_meters: event.target.value })} /></label>
               <label>Stop duration (min)<input type="number" min="1" max="120" value={thresholds.unexpected_stop_threshold_minutes} onChange={(event) => setThresholds({ ...thresholds, unexpected_stop_threshold_minutes: event.target.value })} /></label>
@@ -847,27 +1082,48 @@ export default function App() {
 
         <section className="columns lower-grid">
           <article className="panel" id="timeline">
-            <div className="panel-title"><div><p className="eyebrow">AUDIT TRAIL</p><h2>Safety event timeline</h2></div><span className="tag">{events.length} EVENTS</span></div>
-            {eventsError ? <div className="error" role="alert">Saved events are unavailable: {eventsError}</div> : !workspaceLoaded ? <div className="empty-state" role="status">Loading saved events...</div> : events.length === 0 ? <div className="empty-state">No events yet. Cabin observations and simulated journey events will appear here.</div> : (
+            <div className="panel-title"><div><p className="eyebrow">AUDIT TRAIL</p><h2>Event timeline</h2></div><span className="tag">{visibleEvents.length} MATCHING</span></div>
+            {eventsError ? <div className="error" role="alert">Saved events are unavailable: {eventsError}</div> : !workspaceLoaded ? <div className="empty-state" role="status">Loading saved events...</div> : <>
+              <div className="event-filters" aria-label="Filter timeline events">
+                <label>Search<input type="search" value={eventSearch} onChange={(event) => setEventSearch(event.target.value)} placeholder="Search event details" /></label>
+                <label>Severity<select value={eventSeverityFilter} onChange={(event) => setEventSeverityFilter(event.target.value)}>
+                  <option value="all">All severities</option>
+                  {[...new Set(events.map((event) => event.severity))].map((severity) => <option key={severity} value={severity}>{severity}</option>)}
+                </select></label>
+                <label>Event type<select value={eventTypeFilter} onChange={(event) => setEventTypeFilter(event.target.value)}>
+                  <option value="all">All event types</option>
+                  {[...new Set(events.map((event) => event.event_type))].map((type) => <option key={type} value={type}>{type.replaceAll('_', ' ')}</option>)}
+                </select></label>
+                <label>Source<select value={eventSourceFilter} onChange={(event) => setEventSourceFilter(event.target.value)}>
+                  <option value="all">All sources</option><option value="simulated">Simulated</option><option value="recorded">Recorded / device</option>
+                </select></label>
+              </div>
+              {events.length === 0 ? <div className="empty-state">No events recorded yet. Run a clearly labelled demo scenario to populate the timeline.</div> : visibleEvents.length === 0 ? <div className="empty-state">No events match these filters. Adjust or clear the filters to see recorded events.</div> : (
               <ol className="timeline-list">
-                {events.slice(0, 12).map((event) => (
+                {visibleEvents.slice(0, 12).map((event) => (
                   <li key={event.id} className="timeline-item">
                     <span className={`severity-mark severity-${event.severity}`} aria-hidden="true" />
                     <div className="timeline-copy">
                       <div className="timeline-heading"><strong>{event.event_type.replaceAll('_', ' ')}</strong><span className={`severity-label severity-text-${event.severity}`}>{event.severity}</span></div>
                       <p>{event.observed_fact}</p>
-                      <small>{new Date(event.occurred_at).toLocaleString()} · {eventSourceLabel(event)}</small>
+                      <small>{formatTimestamp(event.occurred_at)} · {eventSourceLabel(event)}</small>
                       <details><summary>Why flagged?</summary><p>{event.rule} {event.inferred_signal} Unknown: {event.unknown}</p></details>
                     </div>
                   </li>
                 ))}
               </ol>
-            )}
+              )}
+            </>}
           </article>
 
           <article className="panel" id="assistant">
             <div className="panel-title"><div><p className="eyebrow">AI ASSISTANT</p><h2>Ask about this session</h2></div><span className="tag">LOCAL MODE</span></div>
             <p className="muted description">Answers are generated from this backend session's event records and rules. No external model is called.</p>
+            <div className="assistant-suggestions" aria-label="Suggested questions">
+              {assistantSuggestions.map((question) => (
+                <button key={question} type="button" disabled={!online || !!busyAction} onClick={() => submitAssistantQuestion(question)}>{question}</button>
+              ))}
+            </div>
             <form className="assistant-form" onSubmit={askAssistant}>
               <label htmlFor="assistant-question">Question</label>
               <textarea id="assistant-question" rows="3" maxLength={500} value={assistantQuestion} onChange={(event) => setAssistantQuestion(event.target.value)} />
@@ -885,20 +1141,41 @@ export default function App() {
         </section>
 
         <section className="panel risk-history-panel">
-          <div className="panel-title"><div><p className="eyebrow">ASSESSMENT HISTORY</p><h2>Recent risk assessments</h2></div><span className="tag">{riskHistory.length} RECORDS</span></div>
-          {riskHistory.length === 0 ? <p className="empty-inline">No risk assessments recorded.</p> : <ol className="risk-history-list">{riskHistory.slice(0, 8).map((assessment) => <li key={assessment.assessment_id}><time>{new Date(assessment.timestamp).toLocaleString()}</time><strong className={`source-${assessment.source}`}>{assessment.risk_level.toUpperCase()}</strong><span>{assessment.risk_score}/100</span><small>{assessment.source.toUpperCase()}</small></li>)}</ol>}
+          <div className="panel-title" id="risk-history"><div><p className="eyebrow">ASSESSMENT HISTORY</p><h2>Risk history &amp; trend</h2></div><span className="tag">{riskHistory.length} RECORDS</span></div>
+          {riskError && <p className="error" role="alert">Risk history unavailable: {riskError}</p>}
+          {riskHistory.length === 0 ? <p className="empty-inline">No risk assessments recorded yet. Assessments appear here after a scenario is run.</p> : <>
+            <div className="risk-trend">
+              <div className="subsection-heading"><strong>Recent score trend</strong><small>Historical prototype rule scores · not predictive accuracy</small></div>
+              <svg viewBox="0 0 100 42" role="img" aria-label="Risk score trend across recent recorded assessments">
+                <line x1="0" y1="8" x2="100" y2="8" />
+                <line x1="0" y1="25" x2="100" y2="25" />
+                <line x1="0" y1="41" x2="100" y2="41" />
+                <polyline points={trendAssessments.map((item, index, items) => {
+                  const x = items.length === 1 ? 50 : (index / (items.length - 1)) * 100
+                  return `${x},${38 - (Math.max(0, Math.min(100, item.risk_score)) * 0.34)}`
+                }).join(' ')} />
+                {trendAssessments.map((item, index, items) => {
+                  const x = items.length === 1 ? 50 : (index / (items.length - 1)) * 100
+                  return <circle key={item.assessment_id} cx={x} cy={38 - (Math.max(0, Math.min(100, item.risk_score)) * 0.34)} r="1.7" />
+                })}
+              </svg>
+              <div className="trend-labels"><span>0</span><span>50</span><span>100</span></div>
+            </div>
+            <ol className="risk-history-list">{riskHistory.slice(0, 8).map((assessment) => <li key={assessment.assessment_id}><time>{formatTimestamp(assessment.timestamp)}</time><strong className={`risk-pill risk-${assessment.risk_level}`}>{assessment.risk_level.toUpperCase()}</strong><span>{assessment.risk_score}/100</span><small>{assessment.source?.toUpperCase() ?? 'UNKNOWN'}{assessment.is_demo ? ' · SIMULATED' : ''}</small></li>)}</ol>
+          </>}
         </section>
 
         <section className="panel contacts-panel" id="contacts">
           <div className="panel-title"><div><p className="eyebrow">USER-CONTROLLED SETTINGS</p><h2>Trusted contacts</h2></div><span className="tag">IN-MEMORY ONLY</span></div>
           <p className="muted description">Contact entries are held in backend memory for this session only. No message provider is configured.</p>
           {contactsError && <p className="error" role="alert">Trusted contacts unavailable: {contactsError}</p>}
-          {contacts.length === 0 ? <p className="empty-inline">No trusted contacts configured.</p> : <ul className="contact-list">{contacts.map((contact) => <li key={contact.id}><span><strong>{contact.name}</strong><small>{contact.channel.toUpperCase()} · {contact.destination_hint}</small></span><button type="button" disabled={!!busyAction} onClick={() => testNotification(contact.id)}>Test notification</button></li>)}</ul>}
+          {contacts.length === 0 ? <p className="empty-inline">No trusted contacts configured.</p> : <ul className="contact-list">{contacts.map((contact) => <li key={contact.id}><span><strong>{contact.name}</strong><small>{contact.channel.toUpperCase()} · {contact.destination_hint}</small></span><div className="contact-actions"><button type="button" disabled={!!busyAction} onClick={() => editContact(contact)}>Edit</button><button type="button" disabled={!!busyAction} onClick={() => testNotification(contact.id)}>Test mock notification</button></div></li>)}</ul>}
           <form className="contact-form" onSubmit={saveContacts}>
             <label>Name<input required maxLength={80} value={contactForm.name} onChange={(event) => setContactForm({ ...contactForm, name: event.target.value })} /></label>
             <label>Channel<select value={contactForm.channel} onChange={(event) => setContactForm({ ...contactForm, channel: event.target.value })}><option value="email">Email</option><option value="sms">SMS</option></select></label>
-            <label>Address or number<input required maxLength={160} autoComplete="off" value={contactForm.destination} onChange={(event) => setContactForm({ ...contactForm, destination: event.target.value })} /></label>
-            <button className="primary" disabled={!online || !!busyAction}>Save contact</button>
+            <label>{editingContactId ? 'Re-enter address or number' : 'Address or number'}<input required maxLength={160} autoComplete="off" value={contactForm.destination} onChange={(event) => setContactForm({ ...contactForm, destination: event.target.value })} placeholder={editingContactId ? 'Address is masked; enter the updated destination' : ''} /></label>
+            <button className="primary" disabled={!online || !!busyAction}>{editingContactId ? 'Update contact' : 'Save contact'}</button>
+            {editingContactId && <button className="cancel-edit" type="button" onClick={() => { setEditingContactId(''); setContactForm({ name: '', channel: 'email', destination: '' }) }}>Cancel edit</button>}
           </form>
           <p className="fine-print">Test mode confirms the UI workflow only. It never sends email or SMS and never reports delivery.</p>
         </section>
