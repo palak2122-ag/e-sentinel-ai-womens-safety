@@ -1,5 +1,8 @@
 import unittest
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,6 +11,7 @@ from fastapi.testclient import TestClient
 from backend import main
 from backend.database import PersistenceError, SQLiteRepository
 from backend.event_engine import EventEngine, MonitoringConfig
+from backend.journey_engine import JourneyEngine
 from backend.risk_engine import RiskEngine
 
 
@@ -69,6 +73,8 @@ class BackendApiTests(unittest.TestCase):
         main.event_engine.initialize()
         main.risk_engine = RiskEngine(main.event_engine.repository)
         main.risk_engine.initialize()
+        main.journey_engine = JourneyEngine(main.event_engine.repository)
+        main.journey_engine.initialize()
         main.event_engine.reset()
         main.event_engine.configure(MonitoringConfig())
         main.event_engine.set_contacts([])
@@ -283,6 +289,432 @@ class BackendApiTests(unittest.TestCase):
             self.client.get("/api/monitoring/state").json()["check_in_status"],
             "simulated_checked_in",
         )
+
+    def test_journey_start_location_and_status_are_persisted(self):
+        started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        response = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "  Home  ",
+                "start_location": {
+                    "latitude": 37.5,
+                    "longitude": -122.2,
+                    "accuracy_meters": 12,
+                    "observed_at": started_at.isoformat(),
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        journey = response.json()
+        self.assertEqual(journey["destination"], "Home")
+        self.assertEqual(journey["status"], "active")
+        self.assertEqual(journey["start_location"]["latitude"], 37.5)
+        self.assertIsNone(journey["ended_at"])
+        active = self.client.get("/api/journeys/active").json()["journey"]
+        self.assertEqual(active["journey_id"], journey["journey_id"])
+        self.assertEqual(
+            self.client.get("/api/journeys").json()["journeys"][0]["status"],
+            "active",
+        )
+
+    def test_journey_rejects_invalid_coordinates_and_second_active_trip(self):
+        invalid = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 91,
+                    "longitude": 0,
+                    "accuracy_meters": 10,
+                },
+            },
+        )
+        self.assertEqual(invalid.status_code, 422)
+
+        now = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        payload = {
+            "destination": "Home",
+            "start_location": {
+                "latitude": 37,
+                "longitude": -122,
+                "accuracy_meters": 10,
+                "observed_at": now,
+            },
+        }
+        self.assertEqual(self.client.post("/api/journeys", json=payload).status_code, 200)
+        duplicate = self.client.post("/api/journeys", json=payload)
+        self.assertEqual(duplicate.status_code, 409)
+
+    def test_journey_rejects_stale_start_and_location_fixes(self):
+        stale_time = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+        stale_start = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 37,
+                    "longitude": -122,
+                    "accuracy_meters": 10,
+                    "observed_at": stale_time,
+                },
+            },
+        )
+        self.assertEqual(stale_start.status_code, 422)
+        self.assertIn("stale", stale_start.json()["detail"][0]["msg"])
+
+        fresh_time = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 37,
+                    "longitude": -122,
+                    "accuracy_meters": 10,
+                    "observed_at": fresh_time,
+                },
+            },
+        ).json()
+        stale_update = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations",
+            json={
+                "latitude": 37.001,
+                "longitude": -122,
+                "accuracy_meters": 10,
+                "observed_at": stale_time,
+            },
+        )
+        self.assertEqual(stale_update.status_code, 422)
+        self.assertIn("stale", stale_update.json()["detail"][0]["msg"])
+
+    def test_journey_rejects_duplicate_and_valid_out_of_order_fixes(self):
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 37,
+                    "longitude": -122,
+                    "accuracy_meters": 10,
+                    "observed_at": started_at.isoformat(),
+                },
+            },
+        ).json()
+        fix_time = started_at + timedelta(seconds=10)
+        first_fix = {
+            "latitude": 37,
+            "longitude": -122,
+            "accuracy_meters": 10,
+            "speed_mps": 2,
+            "observed_at": fix_time.isoformat(),
+        }
+        accepted = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations", json=first_fix
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+
+        duplicate = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations", json=first_fix
+        )
+        out_of_order = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations",
+            json={
+                **first_fix,
+                "observed_at": (fix_time - timedelta(seconds=1)).isoformat(),
+            },
+        )
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(out_of_order.status_code, 409)
+        self.assertIn("newer", duplicate.json()["detail"])
+        self.assertIn("newer", out_of_order.json()["detail"])
+
+    def test_missing_and_completed_journey_location_responses(self):
+        missing_id = "missing-journey"
+        missing_location = self.client.post(
+            f"/api/journeys/{missing_id}/locations",
+            json={
+                "latitude": 37,
+                "longitude": -122,
+                "accuracy_meters": 10,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        missing_end = self.client.post(f"/api/journeys/{missing_id}/end")
+        self.assertEqual(missing_location.status_code, 404)
+        self.assertEqual(missing_end.status_code, 404)
+
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 37,
+                    "longitude": -122,
+                    "accuracy_meters": 10,
+                    "observed_at": started_at.isoformat(),
+                },
+            },
+        ).json()
+        ended = self.client.post(f"/api/journeys/{journey['journey_id']}/end")
+        self.assertEqual(ended.status_code, 200)
+        update_after_end = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations",
+            json={
+                "latitude": 37.001,
+                "longitude": -122,
+                "accuracy_meters": 10,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        second_end = self.client.post(f"/api/journeys/{journey['journey_id']}/end")
+        self.assertEqual(update_after_end.status_code, 409)
+        self.assertEqual(second_end.status_code, 409)
+
+    def test_resetting_demo_events_preserves_real_journey(self):
+        started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 37,
+                    "longitude": -122,
+                    "accuracy_meters": 10,
+                    "observed_at": started_at.isoformat(),
+                },
+            },
+        ).json()
+
+        self.client.delete("/api/events/demo")
+
+        active = self.client.get("/api/journeys/active").json()["journey"]
+        self.assertEqual(active["journey_id"], journey["journey_id"])
+
+    def test_route_deviation_requires_three_accurate_fixes_and_is_persisted(self):
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=100)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Destination",
+                "start_location": {
+                    "latitude": 0,
+                    "longitude": 0,
+                    "accuracy_meters": 8,
+                    "observed_at": started_at.isoformat(),
+                },
+                "planned_route": [
+                    {"latitude": 0, "longitude": 0},
+                    {"latitude": 0, "longitude": 0.02},
+                ],
+            },
+        ).json()
+
+        small_variation = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations",
+            json={
+                "latitude": 0.0001,
+                "longitude": 0.01,
+                "accuracy_meters": 10,
+                "speed_mps": 2,
+                "observed_at": (started_at + timedelta(seconds=10)).isoformat(),
+            },
+        )
+        self.assertEqual(small_variation.status_code, 200, small_variation.text)
+        self.assertEqual(small_variation.json()["new_observations"], [])
+
+        poor_accuracy = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations",
+            json={
+                "latitude": 0.01,
+                "longitude": 0.01,
+                "accuracy_meters": 150,
+                "speed_mps": 2,
+                "observed_at": (started_at + timedelta(seconds=20)).isoformat(),
+            },
+        )
+        self.assertEqual(poor_accuracy.status_code, 200, poor_accuracy.text)
+        self.assertEqual(poor_accuracy.json()["new_observations"], [])
+
+        for second in (30, 40):
+            response = self.client.post(
+                f"/api/journeys/{journey['journey_id']}/locations",
+                json={
+                    "latitude": 0.01,
+                    "longitude": 0.01,
+                    "accuracy_meters": 10,
+                    "speed_mps": 2,
+                    "observed_at": (started_at + timedelta(seconds=second)).isoformat(),
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["new_observations"], [])
+
+        response = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations",
+            json={
+                "latitude": 0.01,
+                "longitude": 0.01,
+                "accuracy_meters": 10,
+                "speed_mps": 2,
+                "observed_at": (started_at + timedelta(seconds=50)).isoformat(),
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        observations = response.json()["new_observations"]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["observation_type"], "route_deviation")
+        self.assertEqual(observations[0]["consecutive_fixes"], 3)
+        reloaded = self.client.get("/api/journeys/active").json()["journey"]
+        self.assertEqual(reloaded["observations"][0]["id"], observations[0]["id"])
+        tracking_state = main.journey_engine.repository.get_journey_tracking_state(
+            journey["journey_id"]
+        )
+        self.assertEqual(tracking_state["route_deviation_streak"], 3)
+        self.assertTrue(tracking_state["route_deviation_active"])
+        self.assertEqual(
+            tracking_state["current_location"]["observed_at"],
+            observations[0]["occurred_at"],
+        )
+
+    def test_concurrent_route_fixes_serialize_detector_state_and_observation(self):
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=80)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Destination",
+                "start_location": {
+                    "latitude": 0,
+                    "longitude": 0,
+                    "accuracy_meters": 8,
+                    "observed_at": started_at.isoformat(),
+                },
+                "planned_route": [
+                    {"latitude": 0, "longitude": 0},
+                    {"latitude": 0, "longitude": 0.02},
+                ],
+            },
+        ).json()
+        for second in (10, 20):
+            seeded = self.client.post(
+                f"/api/journeys/{journey['journey_id']}/locations",
+                json={
+                    "latitude": 0.01,
+                    "longitude": 0.01,
+                    "accuracy_meters": 10,
+                    "speed_mps": 2,
+                    "observed_at": (started_at + timedelta(seconds=second)).isoformat(),
+                },
+            )
+            self.assertEqual(seeded.status_code, 200, seeded.text)
+            self.assertEqual(seeded.json()["new_observations"], [])
+
+        barrier = Barrier(2)
+
+        def submit_fix(second):
+            with TestClient(main.app) as client:
+                barrier.wait()
+                return client.post(
+                    f"/api/journeys/{journey['journey_id']}/locations",
+                    json={
+                        "latitude": 0.01,
+                        "longitude": 0.01,
+                        "accuracy_meters": 10,
+                        "speed_mps": 2,
+                        "observed_at": (
+                            started_at + timedelta(seconds=second)
+                        ).isoformat(),
+                    },
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(submit_fix, (30, 40)))
+
+        successful_responses = [
+            response for response in responses if response.status_code == 200
+        ]
+        self.assertGreaterEqual(len(successful_responses), 1)
+        self.assertIn(
+            sorted(response.status_code for response in responses),
+            ([200, 200], [200, 409]),
+        )
+        generated_observations = [
+            observation
+            for response in successful_responses
+            for observation in response.json()["new_observations"]
+        ]
+        self.assertEqual(len(generated_observations), 1)
+
+        repository = main.journey_engine.repository
+        persisted = repository.get_journey_tracking_state(journey["journey_id"])
+        observations = repository.list_journey_observations(journey["journey_id"])
+        accepted_times = [
+            (started_at + timedelta(seconds=second)).isoformat()
+            for second, response in zip((30, 40), responses)
+            if response.status_code == 200
+        ]
+        self.assertEqual(
+            persisted["route_deviation_streak"], 2 + len(successful_responses)
+        )
+        self.assertTrue(persisted["route_deviation_active"])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["consecutive_fixes"], 3)
+        self.assertEqual(
+            persisted["current_location"]["observed_at"], max(accepted_times)
+        )
+        self.assertIn(observations[0]["occurred_at"], accepted_times)
+
+    def test_gps_derived_stop_requires_threshold_duration_and_journey_can_end(self):
+        main.event_engine.configure(
+            MonitoringConfig(unexpected_stop_threshold_minutes=1)
+        )
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=100)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Office",
+                "start_location": {
+                    "latitude": 37.5,
+                    "longitude": -122.2,
+                    "accuracy_meters": 5,
+                    "speed_mps": 0,
+                    "observed_at": started_at.isoformat(),
+                },
+            },
+        ).json()
+
+        last_response = None
+        for second in (30, 60, 90):
+            last_response = self.client.post(
+                f"/api/journeys/{journey['journey_id']}/locations",
+                json={
+                    "latitude": 37.5,
+                    "longitude": -122.2,
+                    "accuracy_meters": 5,
+                    "speed_mps": 0,
+                    "observed_at": (started_at + timedelta(seconds=second)).isoformat(),
+                },
+            )
+            self.assertEqual(last_response.status_code, 200, last_response.text)
+            if second < 90:
+                self.assertEqual(last_response.json()["new_observations"], [])
+        self.assertEqual(len(last_response.json()["new_observations"]), 1)
+        self.assertEqual(
+            last_response.json()["new_observations"][0]["observation_type"],
+            "unexpected_stop",
+        )
+        self.assertEqual(
+            last_response.json()["new_observations"][0]["expectedness"],
+            "unknown",
+        )
+
+        ended = self.client.post(f"/api/journeys/{journey['journey_id']}/end")
+        self.assertEqual(ended.status_code, 200, ended.text)
+        self.assertEqual(ended.json()["status"], "completed")
+        self.assertIsNotNone(ended.json()["ended_at"])
+        self.assertIsNone(self.client.get("/api/journeys/active").json()["journey"])
 
     def test_contacts_can_be_added_without_exposing_destination(self):
         first = self.client.post(

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from uuid import uuid4
 
-from backend.database import SQLiteRepository
+from backend.database import PersistenceError, SQLiteRepository
 
 
 class SQLiteRepositoryTests(unittest.TestCase):
@@ -49,9 +49,119 @@ class SQLiteRepositoryTests(unittest.TestCase):
         connection.close()
 
         self.assertTrue(
-            {"safety_events", "monitoring_config", "check_in_history", "app_state"}
+            {
+                "safety_events",
+                "monitoring_config",
+                "check_in_history",
+                "app_state",
+                "journeys",
+                "journey_observations",
+            }
             <= tables
         )
+
+    def test_journey_location_and_observation_survive_repository_restart(self):
+        started = datetime.now(timezone.utc) - timedelta(minutes=2)
+        first_fix = {
+            "latitude": 37.5,
+            "longitude": -122.2,
+            "accuracy_meters": 10,
+            "speed_mps": 2,
+            "observed_at": started.isoformat(),
+        }
+        self.repository.create_journey({
+            "journey_id": "journey-1",
+            "destination": "Office",
+            "started_at": started.isoformat(),
+            "start_location": first_fix,
+            "planned_route": [
+                {"latitude": 37.5, "longitude": -122.2},
+                {"latitude": 37.6, "longitude": -122.1},
+            ],
+        })
+        observation_time = (started + timedelta(minutes=1)).isoformat()
+        observation = {
+            "id": "observation-1",
+            "journey_id": "journey-1",
+            "observation_type": "route_deviation",
+            "occurred_at": observation_time,
+            "summary": "GPS position was outside the planned route.",
+            "severity": "medium",
+            "deviation_meters": 700,
+        }
+        self.repository.save_journey_location(
+            "journey-1",
+            {
+                "latitude": 37.51,
+                "longitude": -122.19,
+                "accuracy_meters": 8,
+                "speed_mps": 2,
+                "observed_at": observation_time,
+            },
+            lambda _state: {
+                "route_deviation_streak": 3,
+                "route_deviation_active": True,
+                "stationary_since": None,
+                "stationary_fix_count": 0,
+                "stop_observed": False,
+                "observations": [observation],
+            },
+        )
+
+        restarted = SQLiteRepository(self.db_path)
+        journey = restarted.get_active_journey()
+        saved_observation = restarted.list_journey_observations("journey-1")[0]
+        self.assertEqual(journey["current_location"]["latitude"], 37.51)
+        self.assertEqual(journey["planned_route"][1]["longitude"], -122.1)
+        self.assertEqual(saved_observation["id"], "observation-1")
+        self.assertEqual(saved_observation["deviation_meters"], 700)
+
+    def test_journey_location_and_detector_state_roll_back_on_observation_failure(self):
+        started = datetime.now(timezone.utc) - timedelta(seconds=30)
+        first_fix = {
+            "latitude": 37.5,
+            "longitude": -122.2,
+            "accuracy_meters": 10,
+            "speed_mps": 2,
+            "observed_at": started.isoformat(),
+        }
+        self.repository.create_journey({
+            "journey_id": "journey-rollback",
+            "destination": "Office",
+            "started_at": started.isoformat(),
+            "start_location": first_fix,
+            "planned_route": [],
+        })
+        attempted_time = (started + timedelta(seconds=10)).isoformat()
+
+        with self.assertRaises(PersistenceError):
+            self.repository.save_journey_location(
+                "journey-rollback",
+                {
+                    **first_fix,
+                    "latitude": 37.6,
+                    "observed_at": attempted_time,
+                },
+                lambda _state: {
+                    "route_deviation_streak": 1,
+                    "route_deviation_active": False,
+                    "stationary_since": None,
+                    "stationary_fix_count": 0,
+                    "stop_observed": False,
+                    "observations": [{
+                        "id": "invalid-observation",
+                        "journey_id": "journey-rollback",
+                        "observation_type": "unsupported",
+                        "occurred_at": attempted_time,
+                        "summary": "This insert should violate the observation type constraint.",
+                    }],
+                },
+            )
+
+        persisted = self.repository.get_journey_tracking_state("journey-rollback")
+        self.assertEqual(persisted["current_location"]["observed_at"], started.isoformat())
+        self.assertEqual(persisted["route_deviation_streak"], 0)
+        self.assertEqual(self.repository.list_journey_observations("journey-rollback"), [])
 
     def test_event_survives_new_repository_instance_and_preserves_fields(self):
         event = self.make_event()

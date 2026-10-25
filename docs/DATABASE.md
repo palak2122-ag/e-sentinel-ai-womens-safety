@@ -10,10 +10,14 @@ The backend initializes SQLite during FastAPI lifespan startup. The default file
 - `monitoring_config`: one JSON configuration row keyed by the singleton ID.
 - `check_in_history`: simulated check-in status/timestamps, marked demo.
 - `app_state`: persisted current check-in and last cabin peak values.
+- `journeys`: active/completed journey metadata, destination label, start and latest GPS fixes, optional user-supplied route waypoints, and route/stop detector state. Only one journey can be active at a time.
+- `journey_observations`: timestamped route-deviation and GPS-derived unexpected-stop observations linked to a journey.
 
 Event reads retain the existing response fields and add `status` when retrieved from SQLite. Alerts are derived from persisted medium/high/critical events. Deleting demo events removes only rows marked `is_demo = 1`; uploaded-video observations are retained. Demo check-in history and current demo-only peak/check-in state are cleared by the same reset action. Rule configuration is not cleared.
 
-Trusted-contact destinations intentionally remain in memory only and are excluded from SQLite. Raw videos, annotated preview frames, secrets, and unnecessary personal information are never stored in the database.
+Trusted-contact destinations intentionally remain in memory only and are excluded from SQLite. Raw videos, annotated preview frames, and secrets are never stored in the database. Journey GPS and destination data are stored only after the user starts a journey.
+
+The journey monitor persists the initial and latest location fix, not every intermediate coordinate. Optional route waypoints and user-entered destination labels persist with the journey. Observation records retain derived distance/accuracy/duration facts rather than a copy of each GPS coordinate. Journey records are separate from the resettable demo-event table, so resetting demo events does not delete real journeys.
 
 ## Connection and transaction behavior
 

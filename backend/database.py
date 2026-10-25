@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import Lock
-from typing import Iterator
+from typing import Callable, Iterator
 from uuid import uuid4
 
 
@@ -99,6 +99,44 @@ class SQLiteRepository:
                         key TEXT PRIMARY KEY,
                         value_json TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS journeys (
+                        id TEXT PRIMARY KEY,
+                        destination TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (status IN ('active', 'completed')),
+                        started_at TEXT NOT NULL,
+                        ended_at TEXT,
+                        start_latitude REAL NOT NULL,
+                        start_longitude REAL NOT NULL,
+                        start_accuracy_meters REAL NOT NULL,
+                        start_observed_at TEXT NOT NULL,
+                        current_latitude REAL NOT NULL,
+                        current_longitude REAL NOT NULL,
+                        current_accuracy_meters REAL NOT NULL,
+                        current_observed_at TEXT NOT NULL,
+                        current_speed_mps REAL,
+                        planned_route_json TEXT NOT NULL,
+                        route_deviation_streak INTEGER NOT NULL DEFAULT 0,
+                        route_deviation_active INTEGER NOT NULL DEFAULT 0,
+                        stationary_since TEXT,
+                        stationary_fix_count INTEGER NOT NULL DEFAULT 0,
+                        stop_observed INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_journeys_started_at
+                        ON journeys (started_at DESC);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_journeys_one_active
+                        ON journeys (status) WHERE status = 'active';
+                    CREATE TABLE IF NOT EXISTS journey_observations (
+                        id TEXT PRIMARY KEY,
+                        journey_id TEXT NOT NULL REFERENCES journeys(id) ON DELETE CASCADE,
+                        observation_type TEXT NOT NULL CHECK (observation_type IN (
+                            'route_deviation', 'unexpected_stop'
+                        )),
+                        occurred_at TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        details_json TEXT NOT NULL DEFAULT '{}'
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_journey_observations_time
+                        ON journey_observations (journey_id, occurred_at DESC);
                     CREATE TABLE IF NOT EXISTS risk_assessments (
                         assessment_id TEXT PRIMARY KEY,
                         incident_key TEXT,
@@ -145,6 +183,13 @@ class SQLiteRepository:
                 }
                 if "incident_key" not in risk_columns:
                     connection.execute("ALTER TABLE risk_assessments ADD COLUMN incident_key TEXT")
+                journey_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(journeys)")
+                }
+                if "stationary_fix_count" not in journey_columns:
+                    connection.execute(
+                        "ALTER TABLE journeys ADD COLUMN stationary_fix_count INTEGER NOT NULL DEFAULT 0"
+                    )
                 self._initialized = True
             except (OSError, sqlite3.Error) as exc:
                 raise PersistenceError("Local data storage could not be initialized.") from exc
@@ -321,6 +366,224 @@ class SQLiteRepository:
                 "SELECT value_json FROM app_state WHERE key = 'last_cabin_peak'"
             ).fetchone()
         return json.loads(row["value_json"]) if row else None
+
+    @staticmethod
+    def _journey_response(row: sqlite3.Row) -> dict:
+        return {
+            "journey_id": row["id"],
+            "destination": row["destination"],
+            "status": row["status"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            "start_location": {
+                "latitude": row["start_latitude"],
+                "longitude": row["start_longitude"],
+                "accuracy_meters": row["start_accuracy_meters"],
+                "observed_at": row["start_observed_at"],
+            },
+            "current_location": {
+                "latitude": row["current_latitude"],
+                "longitude": row["current_longitude"],
+                "accuracy_meters": row["current_accuracy_meters"],
+                "speed_mps": row["current_speed_mps"],
+                "observed_at": row["current_observed_at"],
+            },
+            "planned_route": json.loads(row["planned_route_json"]),
+        }
+
+    @staticmethod
+    def _journey_observation_response(row: sqlite3.Row) -> dict:
+        observation = json.loads(row["details_json"])
+        observation.update({
+            "id": row["id"],
+            "journey_id": row["journey_id"],
+            "observation_type": row["observation_type"],
+            "occurred_at": row["occurred_at"],
+            "summary": row["summary"],
+        })
+        return observation
+
+    def create_journey(self, journey: dict) -> dict:
+        location = journey["start_location"]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT id FROM journeys WHERE status = 'active'"
+            ).fetchone()
+            if active is not None:
+                connection.rollback()
+                raise ValueError("An active journey already exists.")
+            connection.execute(
+                """
+                INSERT INTO journeys (
+                    id, destination, status, started_at, start_latitude,
+                    start_longitude, start_accuracy_meters, start_observed_at,
+                    current_latitude, current_longitude, current_accuracy_meters,
+                    current_observed_at, current_speed_mps, planned_route_json
+                ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    journey["journey_id"], journey["destination"], journey["started_at"],
+                    location["latitude"], location["longitude"], location["accuracy_meters"],
+                    location["observed_at"], location["latitude"], location["longitude"],
+                    location["accuracy_meters"], location["observed_at"],
+                    location.get("speed_mps"),
+                    json.dumps(journey["planned_route"], separators=(",", ":")),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM journeys WHERE id = ?", (journey["journey_id"],)
+            ).fetchone()
+            connection.commit()
+        return self._journey_response(row)
+
+    def get_journey(self, journey_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM journeys WHERE id = ?", (journey_id,)
+            ).fetchone()
+        return self._journey_response(row) if row else None
+
+    def get_journey_tracking_state(self, journey_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM journeys WHERE id = ?", (journey_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            **self._journey_response(row),
+            "route_deviation_streak": row["route_deviation_streak"],
+            "route_deviation_active": bool(row["route_deviation_active"]),
+            "stationary_since": row["stationary_since"],
+            "stationary_fix_count": row["stationary_fix_count"],
+            "stop_observed": bool(row["stop_observed"]),
+        }
+
+    def get_active_journey(self) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM journeys WHERE status = 'active'"
+            ).fetchone()
+        return self._journey_response(row) if row else None
+
+    def list_journeys(self, limit: int = 50) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM journeys ORDER BY started_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._journey_response(row) for row in rows]
+
+    def list_journey_observations(self, journey_id: str, limit: int = 100) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM journey_observations
+                WHERE journey_id = ?
+                ORDER BY occurred_at DESC, rowid DESC LIMIT ?
+                """,
+                (journey_id, limit),
+            ).fetchall()
+        return [self._journey_observation_response(row) for row in rows]
+
+    def save_journey_location(
+        self,
+        journey_id: str,
+        location: dict,
+        calculate_detector_state: Callable[[dict], dict],
+    ) -> tuple[dict, list[dict]]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM journeys WHERE id = ?", (journey_id,)
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise LookupError("Journey was not found.")
+            if row["status"] != "active":
+                connection.rollback()
+                raise ValueError("Journey is not active.")
+            if location["observed_at"] <= row["current_observed_at"]:
+                connection.rollback()
+                raise ValueError("Location timestamp must be newer than the last saved fix.")
+            state = {
+                **self._journey_response(row),
+                "route_deviation_streak": row["route_deviation_streak"],
+                "route_deviation_active": bool(row["route_deviation_active"]),
+                "stationary_since": row["stationary_since"],
+                "stationary_fix_count": row["stationary_fix_count"],
+                "stop_observed": bool(row["stop_observed"]),
+            }
+            detector_state = calculate_detector_state(state)
+            observations = detector_state["observations"]
+            connection.execute(
+                """
+                UPDATE journeys SET
+                    current_latitude = ?, current_longitude = ?,
+                    current_accuracy_meters = ?, current_observed_at = ?,
+                    current_speed_mps = ?, route_deviation_streak = ?,
+                    route_deviation_active = ?, stationary_since = ?,
+                    stationary_fix_count = ?, stop_observed = ?
+                WHERE id = ?
+                """,
+                (
+                    location["latitude"], location["longitude"],
+                    location["accuracy_meters"], location["observed_at"],
+                    location.get("speed_mps"),
+                    detector_state["route_deviation_streak"],
+                    int(detector_state["route_deviation_active"]),
+                    detector_state["stationary_since"],
+                    detector_state["stationary_fix_count"],
+                    int(detector_state["stop_observed"]), journey_id,
+                ),
+            )
+            for observation in observations:
+                connection.execute(
+                    """
+                    INSERT INTO journey_observations (
+                        id, journey_id, observation_type, occurred_at, summary, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        observation["id"], journey_id, observation["observation_type"],
+                        observation["occurred_at"], observation["summary"],
+                        json.dumps(
+                            {key: value for key, value in observation.items()
+                             if key not in {"id", "journey_id", "observation_type", "occurred_at", "summary"}},
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            updated = connection.execute(
+                "SELECT * FROM journeys WHERE id = ?", (journey_id,)
+            ).fetchone()
+            connection.commit()
+        return self._journey_response(updated), observations
+
+    def end_journey(self, journey_id: str, ended_at: str) -> dict | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE journeys SET status = 'completed', ended_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (ended_at, journey_id),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT id FROM journeys WHERE id = ?", (journey_id,)
+                ).fetchone()
+                connection.rollback()
+                if exists is None:
+                    return None
+                raise ValueError("Journey is not active.")
+            row = connection.execute(
+                "SELECT * FROM journeys WHERE id = ?", (journey_id,)
+            ).fetchone()
+            connection.commit()
+        return self._journey_response(row)
 
     def save_risk_assessment(self, assessment: dict) -> None:
         with self._connection() as connection:
