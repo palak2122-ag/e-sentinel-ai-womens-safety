@@ -191,10 +191,15 @@ class EventEngine:
 
     def reset(self) -> dict:
         deleted = self.repository.reset_demo_state()
+        check_in = self.repository.load_check_in()
         with self._lock:
             self.last_cabin_peak = None
-            self.check_in_status = "simulated_pending"
-            self.checked_in_at = None
+            if check_in is None:
+                self.check_in_status = "simulated_pending"
+                self.checked_in_at = None
+            else:
+                self.check_in_status = check_in["status"]
+                self.checked_in_at = check_in["occurred_at"]
         return {
             "status": "reset",
             "events_cleared": True,
@@ -333,6 +338,11 @@ class EventEngine:
             "is_demo": True,
             "message": "Simulated check-in recorded; no location or contact was used.",
         }
+
+    def sync_check_in_state(self, status: str, occurred_at: str) -> None:
+        with self._lock:
+            self.check_in_status = status
+            self.checked_in_at = occurred_at
 
     def redacted_contacts(self) -> list[dict]:
         with self._lock:

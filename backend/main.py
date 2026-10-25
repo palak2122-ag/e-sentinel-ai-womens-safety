@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import tempfile
+from uuid import NAMESPACE_URL, uuid5
 
 import cv2
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -190,6 +191,20 @@ def process_pending_escalation(request: EscalationProcessRequest):
         raise HTTPException(status_code=503, detail="Escalation attempt could not be saved.") from exc
 
 
+@app.post("/api/risk/assessments/{assessment_id}/check-in")
+def respond_to_risk_check_in(assessment_id: str):
+    try:
+        response = risk_engine.respond_to_check_in(assessment_id)
+        event_engine.sync_check_in_state(
+            response["check_in_status"], response["occurred_at"]
+        )
+        return response
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PersistenceError as exc:
+        raise HTTPException(status_code=503, detail="Check-in response could not be saved.") from exc
+
+
 @app.get("/api/monitoring/state")
 def monitoring_state():
     try:
@@ -227,16 +242,94 @@ def journey_history(limit: int = Query(default=20, ge=1, le=100)):
 @app.post("/api/journeys/{journey_id}/locations")
 def record_journey_location(journey_id: str, location: LocationFix):
     try:
-        return journey_engine.record_location(
-            journey_id,
-            location,
-            route_deviation_threshold_meters=(
-                event_engine.config.route_deviation_threshold_meters
-            ),
-            unexpected_stop_threshold_minutes=(
-                event_engine.config.unexpected_stop_threshold_minutes
-            ),
+        try:
+            result = journey_engine.record_location(
+                journey_id,
+                location,
+                route_deviation_threshold_meters=(
+                    event_engine.config.route_deviation_threshold_meters
+                ),
+                unexpected_stop_threshold_minutes=(
+                    event_engine.config.unexpected_stop_threshold_minutes
+                ),
+            )
+            idempotent_retry = False
+        except ValueError:
+            if not journey_engine.is_exact_duplicate_location(journey_id, location):
+                raise
+            result = journey_engine.get(journey_id)
+            result["new_observations"] = []
+            idempotent_retry = True
+
+        linked_results = []
+        processed_observation_ids = set()
+        pending_observations = event_engine.repository.list_unlinked_journey_observations(
+            journey_id
         )
+        for observation in pending_observations:
+            event_id = str(uuid5(NAMESPACE_URL, f"e-sentinel:journey-observation:{observation['id']}"))
+            assessment = risk_engine.assess_journey_observation(
+                journey_id, observation, event_id
+            )
+            event_type = observation["observation_type"]
+            rule = (
+                f"GPS route deviation crossed {observation['threshold_meters']} m "
+                f"for {observation['consecutive_fixes']} accurate fixes."
+                if event_type == "route_deviation"
+                else f"GPS-derived low movement exceeded {observation['threshold_minutes']} minutes."
+            )
+            safety_event = event_engine.repository.save_event_once({
+                "id": event_id,
+                "event_type": event_type,
+                "severity": observation.get("severity", "medium"),
+                "occurred_at": observation["occurred_at"],
+                "source": "browser_geolocation",
+                "is_demo": False,
+                "status": "open",
+                "observed_fact": observation["summary"],
+                "inferred_signal": (
+                    "Observed browser GPS data met a detector rule; it does not establish danger or intent."
+                ),
+                "rule": rule,
+                "journey_id": journey_id,
+                "observation_id": observation["id"],
+                "risk_assessment_id": assessment["assessment_id"],
+                "unknown": "Passenger safety and the cause/context of this observation remain unknown.",
+            })
+            linked_observation = event_engine.repository.link_journey_observation(
+                observation["id"], assessment["assessment_id"], event_id
+            )
+            linked_results.append({
+                "observation": linked_observation,
+                "assessment": assessment,
+                "event": safety_event,
+            })
+            processed_observation_ids.add(observation["id"])
+
+        if idempotent_retry:
+            for observation in event_engine.repository.list_journey_observations_at(
+                journey_id, location.observed_at.isoformat()
+            ):
+                if observation["id"] in processed_observation_ids:
+                    continue
+                if not observation["risk_assessment_id"] or not observation["safety_event_id"]:
+                    continue
+                assessment = risk_engine.get_assessment(observation["risk_assessment_id"])
+                safety_event = event_engine.repository.get_event(observation["safety_event_id"])
+                if assessment is not None and safety_event is not None:
+                    linked_results.append({
+                        "observation": observation,
+                        "assessment": assessment,
+                        "event": safety_event,
+                    })
+
+        new_observations = result.get("new_observations", [])
+        persisted_journey = journey_engine.get(journey_id)
+        persisted_journey["new_observations"] = new_observations
+        persisted_journey["idempotent_retry"] = idempotent_retry
+        persisted_journey["linked_results"] = linked_results
+        persisted_journey["risk_results"] = [item["assessment"] for item in linked_results]
+        return persisted_journey
     except JourneyNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

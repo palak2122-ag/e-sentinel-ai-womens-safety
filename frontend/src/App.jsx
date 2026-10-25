@@ -2,6 +2,21 @@
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
+function readableApiError(detail, fallback = 'Request failed') {
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail.map((item) => {
+      if (typeof item === 'string') return item
+      const field = Array.isArray(item.loc) ? item.loc.join('.') : ''
+      return [field, item.msg].filter(Boolean).join(': ') || JSON.stringify(item)
+    }).join('; ')
+  }
+  if (detail && typeof detail === 'object') {
+    return detail.message || detail.msg || JSON.stringify(detail)
+  }
+  return fallback
+}
+
 async function api(path, options = {}) {
   const { headers, ...requestOptions } = options
   const response = await fetch(path, {
@@ -9,7 +24,11 @@ async function api(path, options = {}) {
     headers: { 'Content-Type': 'application/json', ...headers },
   })
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`)
+  if (!response.ok) {
+    throw new Error(
+      readableApiError(data.detail, `Request failed (${response.status})`),
+    )
+  }
   return data
 }
 
@@ -244,6 +263,10 @@ export default function App() {
             setActiveJourney(saved)
             lastSavedLocationTimestampRef.current = position.timestamp
             setLocationError('')
+            if (saved.linked_results?.length) {
+              setRiskAssessment(saved.linked_results[saved.linked_results.length - 1].assessment)
+              await refreshWorkspace()
+            }
           }
         } catch (err) {
           if (locationWatchRef.current !== null) {
@@ -441,6 +464,19 @@ export default function App() {
     })
   }
 
+  function respondToRiskCheckIn() {
+    if (!riskAssessment?.assessment_id) return
+    runAction('risk-checkin', async () => {
+      const result = await api(
+        `/api/risk/assessments/${encodeURIComponent(riskAssessment.assessment_id)}/check-in`,
+        { method: 'POST' },
+      )
+      setNotificationMessage('Passenger response recorded. This does not establish that the passenger is safe.')
+      await refreshWorkspace()
+      setRiskAssessment((current) => current ? { ...current, escalation_state: result.escalation_state } : current)
+    })
+  }
+
   function processPendingEscalation() {
     if (!riskAssessment?.assessment_id) return
     runAction('risk-process', async () => {
@@ -553,7 +589,7 @@ export default function App() {
           <article className="card">
             <p>Rule-based risk score</p>
             <h3 className="amber-text">{riskAssessment ? `${riskAssessment.risk_score}/100` : '—'}</h3>
-            <small>{riskAssessment ? `${riskAssessment.risk_level.toUpperCase()} · simulated assessment` : 'No assessment yet'}</small>
+            <small>{riskAssessment ? `${riskAssessment.risk_level.toUpperCase()} · ${riskAssessment.source?.toUpperCase() ?? 'UNKNOWN'} source` : 'No assessment yet'}</small>
           </article>
         </section>
 
@@ -576,7 +612,7 @@ export default function App() {
             <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('combined')}>Simulate corroborated critical</button>
             <button type="button" disabled={!online || !!busyAction} onClick={() => simulateRiskScenario('unknown')}>Simulate camera unavailable</button>
           </div>
-          <div className="discreet-row"><label><input type="checkbox" checked={discreetMode} onChange={(event) => setDiscreetMode(event.target.checked)} /> Discreet check-in controls</label><div className="escalation-actions">{riskAssessment?.escalation_state === 'escalation_pending' && <button type="button" disabled={!online || !!busyAction} onClick={processPendingEscalation}>Run mock escalation</button>}<button type="button" disabled={!online || !!busyAction || !riskAssessment || !['check_in_required', 'escalation_pending'].includes(riskAssessment.escalation_state)} onClick={cancelPendingAssessment}>{discreetMode ? "I'm OK · cancel pending" : 'Cancel pending demo escalation'}</button></div></div>
+          <div className="discreet-row"><label><input type="checkbox" checked={discreetMode} onChange={(event) => setDiscreetMode(event.target.checked)} /> Discreet check-in controls</label><div className="escalation-actions">{['check_in_required', 'escalation_pending'].includes(riskAssessment?.escalation_state) && <button type="button" disabled={!online || !!busyAction} onClick={respondToRiskCheckIn}>Respond to check-in</button>}{riskAssessment?.escalation_state === 'escalation_pending' && <button type="button" disabled={!online || !!busyAction} onClick={processPendingEscalation}>Run mock escalation</button>}<button type="button" disabled={!online || !!busyAction || !riskAssessment || !['check_in_required', 'escalation_pending'].includes(riskAssessment.escalation_state)} onClick={cancelPendingAssessment}>{discreetMode ? "I'm OK · cancel pending" : 'Cancel pending demo escalation'}</button></div></div>
           {riskAssessment?.notification && <p className="notice" role="status">Mock provider: {riskAssessment.notification.status}. {riskAssessment.notification.provider_response?.message} Real contact notification: no.</p>}
         </section>
 
@@ -644,7 +680,15 @@ export default function App() {
             {activeJourney?.observations?.length > 0 && <div className="journey-observations">
               <strong>Journey observations</strong>
               <ol>{activeJourney.observations.slice(0, 5).map((observation) => (
-                <li key={observation.id}><span>{observationLabel(observation.observation_type)}</span><p>{observation.summary}</p><small>{new Date(observation.occurred_at).toLocaleString()}</small></li>
+                <li key={observation.id}>
+                  <span>{observationLabel(observation.observation_type)} · {(observation.severity ?? 'info').toUpperCase()}</span>
+                  <p>{observation.summary}</p>
+                  {observation.risk_assessment_id && (() => {
+                    const linkedRisk = riskHistory.find((item) => item.assessment_id === observation.risk_assessment_id)
+                    return linkedRisk && <p className="linked-risk">Linked risk: {linkedRisk.risk_level.toUpperCase()} · {linkedRisk.risk_score}/100</p>
+                  })()}
+                  <small>{new Date(observation.occurred_at).toLocaleString()} · {observation.source ?? 'browser_geolocation'} · accuracy ±{Math.round(observation.accuracy_meters ?? 0)} m · {observation.risk_assessment_id ? `assessment ${observation.risk_assessment_id.slice(0, 8)}` : 'risk processing pending'}</small>
+                </li>
               ))}</ol>
             </div>}
             {journeyHistory.length > 0 && <div className="journey-history">
@@ -655,7 +699,8 @@ export default function App() {
                   <details>
                     <summary>Journey details · {item.observations.length} observation(s)</summary>
                     <p>Start: {item.start_location.latitude.toFixed(5)}, {item.start_location.longitude.toFixed(5)} · {item.planned_route.length} planned waypoint(s)</p>
-                    {item.observations.map((observation) => <p key={observation.id}>{observationLabel(observation.observation_type)} · {observation.summary}</p>)}
+                    <p>Last saved fix: {item.current_location.latitude.toFixed(5)}, {item.current_location.longitude.toFixed(5)} · accuracy ±{Math.round(item.current_location.accuracy_meters)} m · {new Date(item.current_location.observed_at).toLocaleString()}</p>
+                    {item.observations.map((observation) => <p key={observation.id}>{observationLabel(observation.observation_type)} · {(observation.severity ?? 'info').toUpperCase()} · {observation.summary} · {observation.risk_assessment_id ? `risk assessment ${observation.risk_assessment_id.slice(0, 8)}` : 'risk link pending'}</p>)}
                   </details>
                 </li>
               ))}</ul>

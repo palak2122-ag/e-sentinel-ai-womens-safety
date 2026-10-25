@@ -34,11 +34,14 @@ If `.venv` does not exist, create it with `py -m venv .venv`, activate it, then 
 
 1. Start the backend and frontend; confirm system status is connected.
 2. Upload `data/cabin_test.mp4`, run analysis, and inspect counts, confidence, and the annotated sampled frame.
-3. In Journey monitor, simulate a route offset, unexpected stop, and missed check-in. Adjust thresholds and inspect each event's rule in the timeline.
-4. Record a simulated passenger check-in and compare the displayed status.
-5. Add a trusted contact, inspect the redacted destination, then run its test notification. The response explicitly confirms nothing was sent.
-6. Ask the local assistant to summarize events or explain the latest rule.
-7. Trigger SOS explicitly; confirm it creates a critical demo event but does not contact anyone. Reset demo events.
+3. Enter a destination and optional waypoint coordinates, explicitly start a journey, grant browser geolocation permission, and confirm the active status. A route deviation requires at least two waypoints; GPS stop observations need repeated accurate fixes.
+4. Inspect a generated journey observation, its linked real-source GPS assessment, event, confidence/accuracy context, and recommended next step. Missing camera/vehicle/check-in inputs remain unknown.
+5. Respond to a waiting risk check-in or cancel a pending mock escalation; no real notification is sent. End the journey and verify it appears in recent history. Reloading does not restart the browser location watcher; resume it explicitly.
+6. Use the separately labelled simulated route/stop/check-in controls if browser GPS is unavailable.
+7. Record a simulated passenger check-in and compare the displayed status.
+8. Add a trusted contact, inspect the redacted destination, then run its test notification. The response explicitly confirms nothing was sent.
+9. Ask the local assistant to summarize events or explain the latest rule.
+10. Trigger SOS explicitly; confirm it creates a critical demo event but does not contact anyone. Reset demo events.
 
 See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 
@@ -63,8 +66,10 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 - `POST /api/monitoring/check-in`: record a simulated check-in.
 - `POST /api/journeys`: start a journey with a destination label and initial browser GPS fix; accepts optional planned route waypoints.
 - `GET /api/journeys/active` and `GET /api/journeys?limit=20`: retrieve the active journey or recent persisted journey history and observations.
-- `POST /api/journeys/{journey_id}/locations`: save a newer GPS fix and evaluate optional route deviation and sustained low movement.
+- `POST /api/journeys/{journey_id}/locations`: save a newer GPS fix; when a new detector observation occurs, process it into an idempotent, journey-linked risk assessment and safety event. The response preserves journey fields and `new_observations`, and adds `linked_results`, `risk_results`, and `idempotent_retry`. If linking fails after the observation is saved, retrying that exact fix resumes the pending link work.
 - `POST /api/journeys/{journey_id}/end`: complete the active journey.
+- `POST /api/risk/assessments/{assessment_id}/check-in`: record an explicit passenger response for a waiting assessment; state returns to monitoring but risk remains unknown.
+- `POST /api/risk/assessments/{assessment_id}/check-in`: record an explicit passenger response and move only an awaiting assessment back to monitoring; risk remains unknown.
 - `GET /api/events?limit=50`: list recent event records (limit 1-100).
 - `GET /api/alerts?limit=50`: list persisted medium/high/critical events.
 - `POST /api/events/demo`: create validated `route_deviation`, `unexpected_stop`, `missed_check_in`, `cabin_person_count_change`, or explicitly user-triggered `user_sos` events.
@@ -82,7 +87,7 @@ See [HACKATHON_DEMO.md](HACKATHON_DEMO.md) for the short judge script.
 
 ### Multi-signal risk engine
 
-This transparent rule-based score is a prototype, not a probability of harm, validated model, or certified vehicle safety system. Defaults: GPS deviation of at least 500 m adds 30 points; stop of at least 5 minutes adds 25; reported sudden braking adds 20; unanswered check-in at least 10 minutes overdue adds 35. A camera detection-count change adds at most 8 weak contextual points and is not proof of distress. Each active signal is weighted by reliability, then the sum is capped at 100. Bands: low 0-19, medium 20-44, high 45-69, critical 70-100.
+This transparent rule-based score is a prototype, not a probability of harm, validated model, or certified vehicle safety system. Defaults: GPS deviation adds 30 points when it meets the supplied observation threshold (or configured default 500 m); GPS-derived low movement lasting at least the observation threshold (or default 5 minutes) adds 25; reported sudden braking adds 20; unanswered check-in at least 10 minutes overdue adds 35. A camera detection-count change adds at most 8 weak contextual points and is not proof of distress. Each active signal is weighted by reliability, then the sum is capped at 100. Bands: low 0-19, medium 20-44, high 45-69, critical 70-100.
 
 Missing/unknown sources, stale timestamps (default 300 seconds), reliability below 0.25, poor GPS accuracy, or future timestamps are excluded and reported as unknown. Approved route changes do not score. High risk asks for a discreet check-in. Critical risk requires at least two reliable corroborating signals and no more than two unknowns before it can enter `escalation_pending`; otherwise it remains check-in-required. Pending escalation can be cancelled before an explicit `POST /api/escalation/process` action. Escalation is disabled unless both `ESENTINEL_ESCALATION_ENABLED=true` and API policy configuration explicitly enable it. The only included provider is a network-isolated mock; its “delivered” status means simulated delivery, never a real contact notification. Unknown signals are never interpreted as evidence that a passenger is safe.
 
@@ -98,12 +103,12 @@ YOLO settings: `YOLO_CONFIDENCE` and `YOLO_IOU` default to `0.45`; `VIDEO_FRAME_
 
 ## Event rules and data sources
 
-Demo route offset and stop/check-in durations remain user-triggered simulation inputs. A real journey begins only after the user explicitly starts it and grants browser geolocation permission. Location fixes must be timestamped within the last 120 seconds; older or out-of-order fixes are rejected. Live route deviation is evaluated only when the user supplies at least two planned-route waypoints: fixes must meet the accuracy filter, exceed the configured threshold plus their reported accuracy, and do so for three consecutive updates. Deviation is unavailable when no route is supplied. A prolonged stop is inferred only from consecutive accurate GPS fixes with gaps no longer than 90 seconds and is labelled GPS-derived; whether it is expected is unknown, and it is not vehicle telemetry. Unusual delay/ETA monitoring is unavailable without routing or schedule data. Uploaded YOLO count changes are video observations; detections alone do not imply identity, intent, harassment, assault, or danger. Severity is an urgency label produced by transparent demo rules, not a safety score. SOS is accepted only through explicit user action.
+Demo route offset and stop/check-in controls remain user-triggered simulations. A browser-GPS journey begins only after the user explicitly starts it and grants location permission. Each accepted fix is stored with its timestamp, coordinates, accuracy, and optional speed. Fixes must be timestamped within the last 120 seconds; older or out-of-order fixes are rejected. Live route deviation is evaluated only when the user supplies at least two planned-route waypoints: fixes must meet the accuracy filter, exceed the configured threshold plus their reported accuracy, and do so for three consecutive updates. Deviation is unavailable when no route is supplied. A prolonged stop is inferred only from consecutive accurate GPS fixes with gaps no longer than 90 seconds and is labelled GPS-derived; whether it is expected is unknown, and it is not vehicle telemetry. Each new observation is connected to one persisted assessment/event by a deterministic observation key; repeating the latest exact fix returns its existing linked result. Unusual delay/ETA monitoring is unavailable without routing or schedule data. Uploaded YOLO count changes are video observations; detections alone do not imply identity, intent, harassment, assault, or danger. Severity is an urgency label produced by transparent demo rules, not a safety score. SOS is accepted only through explicit user action.
 
 ## Privacy, reliability, limitations
 
 - Uploaded video is processed by the local backend. The raw upload is written to an OS temporary file and deleted in request cleanup. The single annotated preview is encoded in memory and returned in the response; it is not retained. Avoid sensitive recordings without consent and authorization.
-- Events, thresholds, cabin peak state, check-ins, journeys, journey observations, and risk state persist in local SQLite. A journey stores its destination label, start and latest GPS fix, optional planned route, and observations; it does not retain a breadcrumb history of every fix. Trusted-contact destinations stay in memory only and disappear on backend restart; API responses show masked destination hints. There is no authentication, production access control, or real alert provider.
+- Events, thresholds, cabin peak state, check-ins, journeys, timestamped journey GPS fixes, journey observations and their assessment/event links, risk state, and escalation history persist in local SQLite. Browser coordinates are sensitive location data; obtain consent and end monitoring when no longer needed. Trusted-contact destinations stay in memory only and disappear on backend restart; API responses show masked destination hints. There is no authentication, production access control, or real alert provider.
 - Risk assessments, escalation transitions, mock notification attempts, and risk policy persist in SQLite. Real delivery is not implemented, and the risk-engine environment gate defaults off.
 - The schematic is not a map provider. Browser GPS is shared with this backend only while a user-started journey is actively monitored; closing/reloading the page stops the browser watcher, and monitoring must be resumed explicitly. A secure browser context is required (`localhost` is allowed). There is no external map, route planner, geocoder, ETA source, vehicle telemetry, or live check-in source. Route deviation requires user-supplied waypoint coordinates.
 - Local assistant answers from structured event history/rules. It does not call an LLM or give emergency guidance. No external credentials or `.env.example` are needed.

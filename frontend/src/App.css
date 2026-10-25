@@ -116,6 +116,7 @@ h2 { font-size: 19px; margin: 7px 0 12px; }
 .journey-observations li, .journey-history li { padding: 9px; border: 1px solid #e4eae4; border-radius: 5px; }
 .journey-observations li > span { color: #946520; font-size: 9px; font-weight: 800; text-transform: capitalize; }
 .journey-observations li p { margin: 5px 0; color: #53645c; font-size: 10px; line-height: 1.5; }
+.journey-observations li .linked-risk { color: #315c4d; font-weight: 700; }
 .journey-observations li small, .journey-history li small { display: block; color: #818d86; font-size: 9px; }
 .route-waypoints { margin: 10px 0; color: #315c4d; font-size: 10px; }
 .route-waypoints summary, .journey-history details summary { cursor: pointer; }

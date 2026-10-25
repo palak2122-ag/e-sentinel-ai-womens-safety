@@ -56,6 +56,7 @@ class SQLiteRepositoryTests(unittest.TestCase):
                 "app_state",
                 "journeys",
                 "journey_observations",
+                "journey_locations",
             }
             <= tables
         )
@@ -111,10 +112,13 @@ class SQLiteRepositoryTests(unittest.TestCase):
         restarted = SQLiteRepository(self.db_path)
         journey = restarted.get_active_journey()
         saved_observation = restarted.list_journey_observations("journey-1")[0]
+        saved_locations = restarted.list_journey_locations("journey-1")
         self.assertEqual(journey["current_location"]["latitude"], 37.51)
         self.assertEqual(journey["planned_route"][1]["longitude"], -122.1)
         self.assertEqual(saved_observation["id"], "observation-1")
         self.assertEqual(saved_observation["deviation_meters"], 700)
+        self.assertEqual(len(saved_locations), 2)
+        self.assertEqual(saved_locations[-1]["latitude"], 37.51)
 
     def test_journey_location_and_detector_state_roll_back_on_observation_failure(self):
         started = datetime.now(timezone.utc) - timedelta(seconds=30)
@@ -233,6 +237,26 @@ class SQLiteRepositoryTests(unittest.TestCase):
             fresh.load_check_in(),
             {"status": "simulated_checked_in", "occurred_at": timestamp},
         )
+
+    def test_demo_reset_preserves_real_assessment_check_in_state(self):
+        timestamp = datetime.now(timezone.utc).isoformat()
+        self.repository.save_passenger_check_in(timestamp, "assessment-real")
+        self.repository.save_check_in(timestamp, "simulated_checked_in")
+        self.repository.save_passenger_check_in(timestamp, "assessment-real")
+
+        self.repository.reset_demo_state()
+
+        check_in = self.repository.load_check_in()
+        self.assertEqual(check_in["status"], "passenger_responded")
+        connection = sqlite3.connect(self.db_path)
+        try:
+            latest_response = connection.execute(
+                """SELECT assessment_id, is_demo FROM check_in_history
+                WHERE status = 'passenger_responded' ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(latest_response, ("assessment-real", 0))
 
     def test_parameterized_details_preserve_unicode_and_json(self):
         event = self.make_event()
