@@ -166,6 +166,22 @@ class BackendApiTests(unittest.TestCase):
         self.assertIsNotNone(event["occurred_at"])
         self.assertEqual(self.client.get("/api/events").json()["events"][0]["id"], event["id"])
 
+    def test_simulated_events_and_demo_sos_do_not_create_risk_assessments(self):
+        simulated = self.client.post(
+            "/api/events/demo",
+            json={"event_type": "route_deviation", "route_deviation_meters": 700},
+        )
+        sos = self.client.post(
+            "/api/events/demo",
+            json={"event_type": "user_sos"},
+        )
+
+        self.assertEqual(simulated.status_code, 200, simulated.text)
+        self.assertEqual(sos.status_code, 200, sos.text)
+        self.assertEqual(len(self.client.get("/api/events").json()["events"]), 2)
+        self.assertEqual(self.client.get("/api/risk/assessments").json()["assessments"], [])
+        self.assertEqual(self.client.get("/api/escalation/history").json()["history"], [])
+
     def test_alert_api_reads_persisted_qualifying_events(self):
         created = self.client.post(
             "/api/events/demo",
@@ -652,6 +668,11 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             len(self.client.get("/api/risk/assessments").json()["assessments"]), 1
         )
+        assessment_history = self.client.get("/api/risk/assessments").json()["assessments"]
+        self.assertEqual(assessment_history[0]["assessment_id"], assessment["assessment_id"])
+        escalation_history = self.client.get("/api/escalation/history").json()["history"]
+        self.assertEqual(len(escalation_history), 1)
+        self.assertEqual(escalation_history[0]["assessment_id"], assessment["assessment_id"])
         self.assertEqual(
             len(self.client.get("/api/events").json()["events"]), 1
         )

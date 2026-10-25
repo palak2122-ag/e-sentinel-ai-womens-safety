@@ -53,6 +53,30 @@ function observationLabel(type) {
   return type === 'unexpected_stop' ? 'prolonged GPS stop' : type.replaceAll('_', ' ')
 }
 
+function eventSourceLabel(event) {
+  if (event.source === 'browser_geolocation') return 'BROWSER GPS'
+  if (event.source === 'uploaded_video_yolo') return 'CABIN VIDEO'
+  if (event.is_demo) return 'SIMULATED'
+  return event.source?.replaceAll('_', ' ').toUpperCase() ?? 'RECORDED'
+}
+
+function locationAccuracyNotice(journey, routeDeviationThreshold) {
+  if (!journey) return null
+
+  const accuracy = journey.current_location.accuracy_meters
+  const insufficientDetectors = []
+  if (
+    journey.planned_route.length >= 2
+    && accuracy > Math.min(100, Math.max(25, routeDeviationThreshold / 4))
+  ) {
+    insufficientDetectors.push('route-deviation checks')
+  }
+  if (accuracy > 50) insufficientDetectors.push('GPS-derived stop checks')
+  if (insufficientDetectors.length === 0) return null
+
+  return `This fix is stored, but its accuracy is insufficient for ${insufficientDetectors.join(' and ')}. No observation or risk assessment is inferred from an unreliable fix.`
+}
+
 export default function App() {
   const [online, setOnline] = useState(false)
   const [file, setFile] = useState(null)
@@ -90,6 +114,10 @@ export default function App() {
   const locationRequestInFlightRef = useRef(false)
   const lastLocationSentAtRef = useRef(0)
   const lastSavedLocationTimestampRef = useRef(0)
+  const gpsAccuracyNotice = locationAccuracyNotice(
+    activeJourney,
+    journey?.configuration?.route_deviation_threshold_meters ?? 500,
+  )
 
   async function refreshWorkspace() {
     const [
@@ -637,6 +665,11 @@ export default function App() {
                   <p>{activeJourney.current_location.latitude.toFixed(5)}, {activeJourney.current_location.longitude.toFixed(5)}</p>
                   <small>Accuracy ±{Math.round(activeJourney.current_location.accuracy_meters)} m · Updated {new Date(activeJourney.current_location.observed_at).toLocaleString()}</small>
                 </div>
+                {gpsAccuracyNotice && (
+                  <p className="fine-print" role="status">
+                    {gpsAccuracyNotice}
+                  </p>
+                )}
                 <div className="journey-details">
                   <div><span>Status</span><strong>{activeJourney.status}</strong></div>
                   <div><span>Started</span><strong>{new Date(activeJourney.started_at).toLocaleString()}</strong></div>
@@ -823,7 +856,7 @@ export default function App() {
                     <div className="timeline-copy">
                       <div className="timeline-heading"><strong>{event.event_type.replaceAll('_', ' ')}</strong><span className={`severity-label severity-text-${event.severity}`}>{event.severity}</span></div>
                       <p>{event.observed_fact}</p>
-                      <small>{new Date(event.occurred_at).toLocaleString()} · {event.is_demo ? 'SIMULATED' : 'VIDEO OBSERVATION'}</small>
+                      <small>{new Date(event.occurred_at).toLocaleString()} · {eventSourceLabel(event)}</small>
                       <details><summary>Why flagged?</summary><p>{event.rule} {event.inferred_signal} Unknown: {event.unknown}</p></details>
                     </div>
                   </li>
