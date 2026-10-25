@@ -29,7 +29,10 @@ class LocationSignal(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source: SignalSource = "unknown"
     deviation_meters: float | None = Field(default=None, ge=0, le=1_000_000)
+    deviation_threshold_meters: float | None = Field(default=None, ge=1, le=100_000)
     accuracy_meters: float | None = Field(default=None, ge=0, le=100_000)
+    stop_duration_minutes: float | None = Field(default=None, ge=0, le=1440)
+    stop_threshold_minutes: int | None = Field(default=None, ge=1, le=240)
     approved_route_change: bool = False
     stale: bool = False
     observed_at: datetime | None = None
@@ -59,6 +62,8 @@ class CheckInSignal(BaseModel):
 class RiskAssessmentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     incident_key: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    journey_id: str | None = Field(default=None, min_length=1, max_length=64)
+    event_id: str | None = Field(default=None, min_length=1, max_length=64)
     camera: CameraSignal | None = None
     gps: LocationSignal | None = None
     vehicle: VehicleSignal | None = None
@@ -224,14 +229,30 @@ class RiskEngine:
 
         gps = request.gps
         gps_checks = []
+        deviation_threshold = (
+            gps.deviation_threshold_meters
+            if gps is not None and gps.deviation_threshold_meters is not None
+            else self.policy.route_deviation_meters
+        )
+        stop_threshold = (
+            gps.stop_threshold_minutes
+            if gps is not None and gps.stop_threshold_minutes is not None
+            else self.policy.unexpected_stop_minutes
+        )
         if gps is not None and gps.approved_route_change:
             gps_checks.append((False, 0, "Passenger-approved route change; no deviation penalty."))
         elif gps is not None and gps.accuracy_meters is not None and gps.accuracy_meters > 100:
             missing.append("gps: accuracy too poor for route scoring")
             gps = None
         else:
-            gps_checks.append((gps is not None and gps.deviation_meters is not None and gps.deviation_meters >= self.policy.route_deviation_meters,
-                               30, f"Route deviation is at least {self.policy.route_deviation_meters} m."))
+            gps_checks.append((gps is not None and gps.deviation_meters is not None and gps.deviation_meters >= deviation_threshold,
+                               30, f"Route deviation is at least {deviation_threshold:g} m."))
+        gps_checks.append((
+            gps is not None and gps.stop_duration_minutes is not None
+            and gps.stop_duration_minutes >= stop_threshold,
+            25,
+            f"GPS-derived low movement persisted for at least {stop_threshold} minutes; stop context is unknown.",
+        ))
         consider("gps", gps, gps_checks)
 
         vehicle = request.vehicle
@@ -278,6 +299,8 @@ class RiskEngine:
         assessment = {
             "assessment_id": str(uuid4()),
             "incident_key": request.incident_key,
+            "journey_id": request.journey_id,
+            "event_id": request.event_id,
             "timestamp": now.isoformat(),
             "risk_score": score,
             "risk_level": level,
@@ -303,22 +326,79 @@ class RiskEngine:
                 "explanation": "Pose keypoints are not interpreted as distress, intent, or danger and do not affect this score.",
             })
 
-        self.repository.save_risk_assessment(assessment)
-        history = []
-        history.append(self.repository.save_escalation_state(
-            assessment["assessment_id"], escalation_state, action, assessment["is_demo"]
-        ))
+        saved, initial_state, created = self.repository.save_assessment_with_initial_state(
+            assessment, escalation_state, action
+        )
+        assessment.update(saved)
+        current_state = initial_state
+        if not created:
+            current_state = self.repository.latest_escalation_for(
+                assessment["assessment_id"]
+            ) or initial_state
+        assessment["escalation_state"] = current_state["state"]
+        assessment["escalation_history"] = [current_state]
+        assessment["is_duplicate"] = not created
         notification = None
-        assessment["escalation_state"] = escalation_state
-        assessment["escalation_history"] = history
+        if not created and assessment.get("incident_key"):
+            notification = self.repository.get_notification_by_key(
+                f"incident:{assessment['incident_key']}"
+            )
         assessment["notification"] = notification
         return assessment
+
+    def assess_journey_observation(
+        self, journey_id: str, observation: dict, event_id: str
+    ) -> dict:
+        observation_type = observation["observation_type"]
+        details = observation
+        if observation_type == "route_deviation":
+            gps = LocationSignal(
+                source="real",
+                deviation_meters=details["deviation_meters"],
+                deviation_threshold_meters=details["threshold_meters"],
+                accuracy_meters=details["accuracy_meters"],
+                observed_at=datetime.fromisoformat(observation["occurred_at"]),
+            )
+        elif observation_type == "unexpected_stop":
+            gps = LocationSignal(
+                source="real",
+                accuracy_meters=details.get("accuracy_meters", 0),
+                stop_duration_minutes=details["stationary_minutes"],
+                stop_threshold_minutes=details["threshold_minutes"],
+                observed_at=datetime.fromisoformat(observation["occurred_at"]),
+            )
+        else:
+            raise ValueError("Unsupported journey observation type.")
+
+        request = RiskAssessmentRequest(
+            incident_key=f"journeyobs:{observation['id']}",
+            journey_id=journey_id,
+            event_id=event_id,
+            gps=gps,
+            demo_mode=False,
+        )
+        return self.assess(request)
 
     def process_pending(self, assessment_id: str) -> dict:
         assessment = self.repository.get_risk_assessment(assessment_id)
         if assessment is None:
             raise ValueError("Risk assessment was not found.")
         latest = self.repository.latest_escalation_for(assessment_id)
+        if latest is not None and latest["state"] in {"notified", "delivery_failed"}:
+            notification_key = (
+                f"incident:{assessment['incident_key']}"
+                if assessment.get("incident_key")
+                else f"risk:{assessment_id}"
+            )
+            attempt = self.repository.get_notification_by_key(notification_key)
+            return {
+                "assessment_id": assessment_id,
+                "state": latest["state"],
+                "notification": attempt,
+                "transition": latest,
+                "real_notification_sent": False,
+                "idempotent_replay": True,
+            }
         if latest is None or latest["state"] != "escalation_pending":
             raise ValueError("This assessment has no pending escalation to process.")
         notification = self._notify(assessment)
@@ -340,6 +420,32 @@ class RiskEngine:
             "notification": notification,
             "transition": record,
             "real_notification_sent": False,
+        }
+
+    def respond_to_check_in(self, assessment_id: str) -> dict:
+        assessment = self.repository.get_risk_assessment(assessment_id)
+        if assessment is None:
+            raise ValueError("Risk assessment was not found.")
+        latest = self.repository.latest_escalation_for(assessment_id)
+        if latest is None or latest["state"] not in {
+            "check_in_required", "escalation_pending"
+        }:
+            raise ValueError("This assessment is not waiting for a passenger check-in.")
+        occurred_at = self._utc_now().isoformat()
+        self.repository.save_passenger_check_in(occurred_at, assessment_id)
+        transition = self.repository.save_escalation_state(
+            assessment_id,
+            "monitoring",
+            "Passenger explicitly responded to the check-in; this is not a safety determination.",
+            assessment["is_demo"],
+        )
+        return {
+            "assessment_id": assessment_id,
+            "check_in_status": "passenger_responded",
+            "occurred_at": occurred_at,
+            "escalation_state": "monitoring",
+            "transition": transition,
+            "safety_assessment": "UNKNOWN",
         }
 
     def _notify(self, assessment: dict) -> dict:
@@ -402,11 +508,21 @@ class RiskEngine:
         if not items:
             return None
         assessment = items[0]
-        escalation = self.repository.latest_escalation()
+        escalation = self.repository.latest_escalation_for(
+            assessment["assessment_id"]
+        )
         assessment["escalation_state"] = (
             escalation["state"] if escalation and escalation["assessment_id"] == assessment["assessment_id"]
             else "monitoring"
         )
+        return assessment
+
+    def get_assessment(self, assessment_id: str) -> dict | None:
+        assessment = self.repository.get_risk_assessment(assessment_id)
+        if assessment is None:
+            return None
+        escalation = self.repository.latest_escalation_for(assessment_id)
+        assessment["escalation_state"] = escalation["state"] if escalation else "monitoring"
         return assessment
 
     def history(self, limit: int = 50) -> list[dict]:

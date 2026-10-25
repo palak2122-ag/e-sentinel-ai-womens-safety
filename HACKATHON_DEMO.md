@@ -14,7 +14,7 @@ Upload `data/cabin_test.mp4` and run the analysis. Show processed frames, the 48
 
 ## Journey event engine
 
-Show the schematic route and its `ILLUSTRATIVE ONLY · NOT GPS` label before starting a trip. If presenting live location, explicitly start a journey, grant the browser's location request, and point out the displayed accuracy and update time. Planned waypoints must be entered by the user; route deviation is not assessed without them. Change the route-offset threshold, then use the labelled simulation controls for a route-deviation event, unexpected stop, and missed check-in. Open a timeline item's “Why flagged?” details and explain its observed input, threshold rule, inferred signal, and unknowns. Record a simulated check-in, then reset the demo events.
+Show the schematic route and its `ILLUSTRATIVE ONLY · NOT GPS` label before starting a trip. If presenting browser GPS, explicitly start a journey, grant the browser's location request, and point out the displayed accuracy and update time. Planned waypoints must be entered by the user; route deviation is not assessed without them. Keep the trip active long enough for three accurate fixes beyond the route threshold. Show the generated observation, its browser-GPS event and linked real-source rule assessment, including score, missing signals, and recommended action. Demonstrate the explicit passenger check-in response or cancellation; neither establishes that someone is safe. End the journey and confirm it appears in history. Use the separate labelled simulation controls for a route deviation, unexpected stop, and missed check-in when live GPS is unavailable.
 
 ## Contact and notification workflow
 

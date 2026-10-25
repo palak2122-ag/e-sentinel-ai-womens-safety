@@ -226,6 +226,7 @@ class JourneyEngine:
                             "stationary_minutes": round(stationary_duration, 1),
                             "consecutive_fixes": stationary_fix_count,
                             "threshold_minutes": unexpected_stop_threshold_minutes,
+                            "accuracy_meters": current["accuracy_meters"],
                             "expectedness": "unknown",
                             "source": "browser_geolocation",
                         },
@@ -289,6 +290,19 @@ class JourneyEngine:
         return earth_radius_meters * 2 * atan2(
             sqrt(haversine), sqrt(max(0, 1 - haversine))
         )
+
+    def is_exact_duplicate_location(self, journey_id: str, location: LocationFix) -> bool:
+        state = self.repository.get_journey_tracking_state(journey_id)
+        if state is None or state["status"] != "active":
+            return False
+        current = state["current_location"]
+        return all((
+            current["latitude"] == location.latitude,
+            current["longitude"] == location.longitude,
+            current["accuracy_meters"] == location.accuracy_meters,
+            current["speed_mps"] == location.speed_mps,
+            current["observed_at"] == location.observed_at.isoformat(),
+        ))
 
     @classmethod
     def distance_to_route(cls, location: dict, route: list[dict]) -> float:

@@ -93,7 +93,8 @@ class SQLiteRepository:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         occurred_at TEXT NOT NULL,
                         status TEXT NOT NULL,
-                        is_demo INTEGER NOT NULL CHECK (is_demo IN (0, 1))
+                        is_demo INTEGER NOT NULL CHECK (is_demo IN (0, 1)),
+                        assessment_id TEXT
                     );
                     CREATE TABLE IF NOT EXISTS app_state (
                         key TEXT PRIMARY KEY,
@@ -133,13 +134,28 @@ class SQLiteRepository:
                         )),
                         occurred_at TEXT NOT NULL,
                         summary TEXT NOT NULL,
-                        details_json TEXT NOT NULL DEFAULT '{}'
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        risk_assessment_id TEXT,
+                        safety_event_id TEXT
                     );
+                    CREATE TABLE IF NOT EXISTS journey_locations (
+                        journey_id TEXT NOT NULL REFERENCES journeys(id) ON DELETE CASCADE,
+                        observed_at TEXT NOT NULL,
+                        latitude REAL NOT NULL,
+                        longitude REAL NOT NULL,
+                        accuracy_meters REAL NOT NULL,
+                        speed_mps REAL,
+                        PRIMARY KEY (journey_id, observed_at)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_journey_locations_time
+                        ON journey_locations (journey_id, observed_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_journey_observations_time
                         ON journey_observations (journey_id, occurred_at DESC);
                     CREATE TABLE IF NOT EXISTS risk_assessments (
                         assessment_id TEXT PRIMARY KEY,
                         incident_key TEXT,
+                        journey_id TEXT,
+                        event_id TEXT,
                         occurred_at TEXT NOT NULL,
                         risk_score INTEGER NOT NULL CHECK (risk_score BETWEEN 0 AND 100),
                         risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
@@ -183,6 +199,10 @@ class SQLiteRepository:
                 }
                 if "incident_key" not in risk_columns:
                     connection.execute("ALTER TABLE risk_assessments ADD COLUMN incident_key TEXT")
+                if "journey_id" not in risk_columns:
+                    connection.execute("ALTER TABLE risk_assessments ADD COLUMN journey_id TEXT")
+                if "event_id" not in risk_columns:
+                    connection.execute("ALTER TABLE risk_assessments ADD COLUMN event_id TEXT")
                 journey_columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(journeys)")
                 }
@@ -190,6 +210,27 @@ class SQLiteRepository:
                     connection.execute(
                         "ALTER TABLE journeys ADD COLUMN stationary_fix_count INTEGER NOT NULL DEFAULT 0"
                     )
+                check_in_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(check_in_history)")
+                }
+                if "assessment_id" not in check_in_columns:
+                    connection.execute("ALTER TABLE check_in_history ADD COLUMN assessment_id TEXT")
+                journey_observation_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(journey_observations)")
+                }
+                if "risk_assessment_id" not in journey_observation_columns:
+                    connection.execute(
+                        "ALTER TABLE journey_observations ADD COLUMN risk_assessment_id TEXT"
+                    )
+                if "safety_event_id" not in journey_observation_columns:
+                    connection.execute(
+                        "ALTER TABLE journey_observations ADD COLUMN safety_event_id TEXT"
+                    )
+                connection.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_journey_incident
+                    ON risk_assessments (journey_id, incident_key)
+                    WHERE journey_id IS NOT NULL AND incident_key IS NOT NULL"""
+                )
                 self._initialized = True
             except (OSError, sqlite3.Error) as exc:
                 raise PersistenceError("Local data storage could not be initialized.") from exc
@@ -223,6 +264,28 @@ class SQLiteRepository:
                 SQLiteRepository._event_details(event),
             ),
         )
+
+    def save_event_once(self, event: dict) -> dict:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT OR IGNORE INTO safety_events (
+                    id, event_type, severity, occurred_at, summary, source,
+                    is_demo, status, explanation, trigger_reason, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event["id"], event["event_type"], event["severity"],
+                    event["occurred_at"], event["observed_fact"], event["source"],
+                    int(event["is_demo"]), event.get("status", "open"),
+                    event["inferred_signal"], event["rule"],
+                    self._event_details(event),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM safety_events WHERE id = ?", (event["id"],)
+            ).fetchone()
+            connection.commit()
+        return self._event_response(row)
 
     @staticmethod
     def _event_response(row: sqlite3.Row) -> dict:
@@ -284,6 +347,13 @@ class SQLiteRepository:
             ).fetchall()
         return [self._event_response(row) for row in rows]
 
+    def get_event(self, event_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM safety_events WHERE id = ?", (event_id,)
+            ).fetchone()
+        return self._event_response(row) if row else None
+
     def list_alerts(self, limit: int = 100) -> list[dict]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -311,9 +381,18 @@ class SQLiteRepository:
             )
             connection.execute("DELETE FROM risk_assessments WHERE is_demo = 1")
             connection.execute("DELETE FROM check_in_history WHERE is_demo = 1")
-            connection.execute(
-                "DELETE FROM app_state WHERE key IN ('check_in', 'last_cabin_peak')"
-            )
+            check_in_state = connection.execute(
+                "SELECT value_json FROM app_state WHERE key = 'check_in'"
+            ).fetchone()
+            if check_in_state is not None:
+                saved_check_in = json.loads(check_in_state["value_json"])
+                is_demo_check_in = saved_check_in.get(
+                    "is_demo",
+                    str(saved_check_in.get("status", "")).startswith("simulated_"),
+                )
+                if is_demo_check_in:
+                    connection.execute("DELETE FROM app_state WHERE key = 'check_in'")
+            connection.execute("DELETE FROM app_state WHERE key = 'last_cabin_peak'")
             connection.commit()
         return deleted
 
@@ -337,19 +416,49 @@ class SQLiteRepository:
             ).fetchone()
         return json.loads(row["config_json"]) if row else None
 
-    def save_check_in(self, occurred_at: str, status: str) -> None:
+    def save_check_in(
+        self, occurred_at: str, status: str, assessment_id: str | None = None,
+        *, is_demo: bool = True,
+    ) -> None:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                "INSERT INTO check_in_history (occurred_at, status, is_demo) VALUES (?, ?, 1)",
-                (occurred_at, status),
+                """INSERT INTO check_in_history
+                (occurred_at, status, is_demo, assessment_id) VALUES (?, ?, ?, ?)""",
+                (occurred_at, status, int(is_demo), assessment_id),
             )
             connection.execute(
                 """
                 INSERT INTO app_state (key, value_json) VALUES ('check_in', ?)
                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
                 """,
-                (json.dumps({"status": status, "occurred_at": occurred_at}),),
+                (json.dumps({
+                    "status": status,
+                    "occurred_at": occurred_at,
+                    "assessment_id": assessment_id,
+                    "is_demo": is_demo,
+                }),),
+            )
+            connection.commit()
+
+    def save_passenger_check_in(self, occurred_at: str, assessment_id: str) -> None:
+        status = "passenger_responded"
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO check_in_history
+                (occurred_at, status, is_demo, assessment_id) VALUES (?, ?, 0, ?)""",
+                (occurred_at, status, assessment_id),
+            )
+            connection.execute(
+                """INSERT INTO app_state (key, value_json) VALUES ('check_in', ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json""",
+                (json.dumps({
+                    "status": status,
+                    "occurred_at": occurred_at,
+                    "assessment_id": assessment_id,
+                    "is_demo": False,
+                }),),
             )
             connection.commit()
 
@@ -358,7 +467,10 @@ class SQLiteRepository:
             row = connection.execute(
                 "SELECT value_json FROM app_state WHERE key = 'check_in'"
             ).fetchone()
-        return json.loads(row["value_json"]) if row else None
+        if row is None:
+            return None
+        saved = json.loads(row["value_json"])
+        return {"status": saved["status"], "occurred_at": saved["occurred_at"]}
 
     def load_last_cabin_peak(self) -> int | None:
         with self._connection() as connection:
@@ -400,6 +512,8 @@ class SQLiteRepository:
             "observation_type": row["observation_type"],
             "occurred_at": row["occurred_at"],
             "summary": row["summary"],
+            "risk_assessment_id": row["risk_assessment_id"],
+            "safety_event_id": row["safety_event_id"],
         })
         return observation
 
@@ -429,6 +543,16 @@ class SQLiteRepository:
                     location["accuracy_meters"], location["observed_at"],
                     location.get("speed_mps"),
                     json.dumps(journey["planned_route"], separators=(",", ":")),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO journey_locations (
+                    journey_id, observed_at, latitude, longitude, accuracy_meters, speed_mps
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    journey["journey_id"], location["observed_at"],
+                    location["latitude"], location["longitude"],
+                    location["accuracy_meters"], location.get("speed_mps"),
                 ),
             )
             row = connection.execute(
@@ -487,6 +611,56 @@ class SQLiteRepository:
             ).fetchall()
         return [self._journey_observation_response(row) for row in rows]
 
+    def list_unlinked_journey_observations(self, journey_id: str) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM journey_observations
+                WHERE journey_id = ? AND risk_assessment_id IS NULL
+                ORDER BY occurred_at, rowid""",
+                (journey_id,),
+            ).fetchall()
+        return [self._journey_observation_response(row) for row in rows]
+
+    def list_journey_observations_at(
+        self, journey_id: str, occurred_at: str
+    ) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM journey_observations
+                WHERE journey_id = ? AND occurred_at = ?
+                ORDER BY rowid""",
+                (journey_id, occurred_at),
+            ).fetchall()
+        return [self._journey_observation_response(row) for row in rows]
+
+    def link_journey_observation(
+        self, observation_id: str, risk_assessment_id: str, safety_event_id: str
+    ) -> dict | None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE journey_observations
+                SET risk_assessment_id = COALESCE(risk_assessment_id, ?),
+                    safety_event_id = COALESCE(safety_event_id, ?)
+                WHERE id = ?""",
+                (risk_assessment_id, safety_event_id, observation_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM journey_observations WHERE id = ?", (observation_id,)
+            ).fetchone()
+            connection.commit()
+        return self._journey_observation_response(row) if row else None
+
+    def list_journey_locations(self, journey_id: str, limit: int = 500) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT journey_id, observed_at, latitude, longitude,
+                accuracy_meters, speed_mps FROM journey_locations
+                WHERE journey_id = ? ORDER BY observed_at, rowid LIMIT ?""",
+                (journey_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def save_journey_location(
         self,
         journey_id: str,
@@ -536,6 +710,16 @@ class SQLiteRepository:
                     detector_state["stationary_since"],
                     detector_state["stationary_fix_count"],
                     int(detector_state["stop_observed"]), journey_id,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO journey_locations (
+                    journey_id, observed_at, latitude, longitude, accuracy_meters, speed_mps
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    journey_id, location["observed_at"], location["latitude"],
+                    location["longitude"], location["accuracy_meters"],
+                    location.get("speed_mps"),
                 ),
             )
             for observation in observations:
@@ -590,12 +774,15 @@ class SQLiteRepository:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """INSERT INTO risk_assessments (
-                    assessment_id, incident_key, occurred_at, risk_score, risk_level,
+                    assessment_id, incident_key, journey_id, event_id,
+                    occurred_at, risk_score, risk_level,
                     reasons_json, signals_json, data_quality_json, recommended_action,
                     source, is_demo
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    assessment["assessment_id"], assessment.get("incident_key"), assessment["timestamp"],
+                    assessment["assessment_id"], assessment.get("incident_key"),
+                    assessment.get("journey_id"), assessment.get("event_id"),
+                    assessment["timestamp"],
                     assessment["risk_score"], assessment["risk_level"],
                     json.dumps(assessment["reasons"]),
                     json.dumps(assessment["signals_used"]),
@@ -605,6 +792,76 @@ class SQLiteRepository:
                 ),
             )
             connection.commit()
+
+    def save_assessment_with_initial_state(
+        self, assessment: dict, state: str, reason: str
+    ) -> tuple[dict, dict, bool]:
+        """Save an assessment and its first escalation state atomically and idempotently."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = None
+            if assessment.get("journey_id") and assessment.get("incident_key"):
+                existing = connection.execute(
+                    """SELECT * FROM risk_assessments
+                    WHERE journey_id = ? AND incident_key = ?""",
+                    (assessment["journey_id"], assessment["incident_key"]),
+                ).fetchone()
+            if existing is not None:
+                saved_assessment = self._risk_response(existing)
+                escalation = connection.execute(
+                    """SELECT * FROM escalation_history WHERE assessment_id = ?
+                    ORDER BY occurred_at DESC, rowid DESC LIMIT 1""",
+                    (saved_assessment["assessment_id"],),
+                ).fetchone()
+                connection.commit()
+                return saved_assessment, dict(escalation), False
+
+            connection.execute(
+                """INSERT INTO risk_assessments (
+                    assessment_id, incident_key, journey_id, event_id,
+                    occurred_at, risk_score, risk_level, reasons_json, signals_json,
+                    data_quality_json, recommended_action, source, is_demo
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    assessment["assessment_id"], assessment.get("incident_key"),
+                    assessment.get("journey_id"), assessment.get("event_id"),
+                    assessment["timestamp"], assessment["risk_score"],
+                    assessment["risk_level"], json.dumps(assessment["reasons"]),
+                    json.dumps(assessment["signals_used"]),
+                    json.dumps(assessment["data_quality"]),
+                    assessment["recommended_action"], assessment["source"],
+                    int(assessment["is_demo"]),
+                ),
+            )
+            escalation = {
+                "id": str(uuid4()),
+                "assessment_id": assessment["assessment_id"],
+                "state": state,
+                "occurred_at": assessment["timestamp"],
+                "reason": reason,
+                "is_demo": assessment["is_demo"],
+            }
+            connection.execute(
+                "INSERT INTO escalation_history VALUES (?, ?, ?, ?, ?, ?)",
+                tuple(escalation.values()),
+            )
+            row = connection.execute(
+                "SELECT * FROM risk_assessments WHERE assessment_id = ?",
+                (assessment["assessment_id"],),
+            ).fetchone()
+            connection.commit()
+        return self._risk_response(row), escalation, True
+
+    def get_risk_assessment_by_incident(
+        self, journey_id: str, incident_key: str
+    ) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM risk_assessments
+                WHERE journey_id = ? AND incident_key = ?""",
+                (journey_id, incident_key),
+            ).fetchone()
+        return self._risk_response(row) if row else None
 
     def save_risk_policy(self, policy: dict) -> None:
         with self._connection() as connection:
@@ -628,6 +885,8 @@ class SQLiteRepository:
         return {
             "assessment_id": row["assessment_id"],
             "incident_key": row["incident_key"],
+            "journey_id": row["journey_id"],
+            "event_id": row["event_id"],
             "timestamp": row["occurred_at"],
             "risk_score": row["risk_score"],
             "risk_level": row["risk_level"],

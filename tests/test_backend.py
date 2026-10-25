@@ -166,6 +166,22 @@ class BackendApiTests(unittest.TestCase):
         self.assertIsNotNone(event["occurred_at"])
         self.assertEqual(self.client.get("/api/events").json()["events"][0]["id"], event["id"])
 
+    def test_simulated_events_and_demo_sos_do_not_create_risk_assessments(self):
+        simulated = self.client.post(
+            "/api/events/demo",
+            json={"event_type": "route_deviation", "route_deviation_meters": 700},
+        )
+        sos = self.client.post(
+            "/api/events/demo",
+            json={"event_type": "user_sos"},
+        )
+
+        self.assertEqual(simulated.status_code, 200, simulated.text)
+        self.assertEqual(sos.status_code, 200, sos.text)
+        self.assertEqual(len(self.client.get("/api/events").json()["events"]), 2)
+        self.assertEqual(self.client.get("/api/risk/assessments").json()["assessments"], [])
+        self.assertEqual(self.client.get("/api/escalation/history").json()["history"], [])
+
     def test_alert_api_reads_persisted_qualifying_events(self):
         created = self.client.post(
             "/api/events/demo",
@@ -348,6 +364,22 @@ class BackendApiTests(unittest.TestCase):
 
     def test_journey_rejects_stale_start_and_location_fixes(self):
         stale_time = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+        future_time = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+        future_start = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 37,
+                    "longitude": -122,
+                    "accuracy_meters": 10,
+                    "observed_at": future_time,
+                },
+            },
+        )
+        self.assertEqual(future_start.status_code, 422)
+        self.assertIn("future", future_start.json()["detail"][0]["msg"])
+
         stale_start = self.client.post(
             "/api/journeys",
             json={
@@ -388,6 +420,35 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(stale_update.status_code, 422)
         self.assertIn("stale", stale_update.json()["detail"][0]["msg"])
 
+    def test_location_update_derives_speed_when_browser_speed_is_unavailable(self):
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Home",
+                "start_location": {
+                    "latitude": 37.5,
+                    "longitude": -122.2,
+                    "accuracy_meters": 10,
+                    "observed_at": started_at.isoformat(),
+                },
+            },
+        ).json()
+
+        response = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations",
+            json={
+                "latitude": 37.50001,
+                "longitude": -122.2,
+                "accuracy_meters": 10,
+                "observed_at": (started_at + timedelta(seconds=10)).isoformat(),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(response.json()["current_location"]["speed_mps"])
+        self.assertEqual(response.json()["new_observations"], [])
+
     def test_journey_rejects_duplicate_and_valid_out_of_order_fixes(self):
         started_at = datetime.now(timezone.utc) - timedelta(seconds=60)
         journey = self.client.post(
@@ -425,9 +486,10 @@ class BackendApiTests(unittest.TestCase):
                 "observed_at": (fix_time - timedelta(seconds=1)).isoformat(),
             },
         )
-        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.status_code, 200, duplicate.text)
+        self.assertTrue(duplicate.json()["idempotent_retry"])
+        self.assertEqual(duplicate.json()["new_observations"], [])
         self.assertEqual(out_of_order.status_code, 409)
-        self.assertIn("newer", duplicate.json()["detail"])
         self.assertIn("newer", out_of_order.json()["detail"])
 
     def test_missing_and_completed_journey_location_responses(self):
@@ -524,6 +586,7 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(small_variation.status_code, 200, small_variation.text)
         self.assertEqual(small_variation.json()["new_observations"], [])
+        self.assertEqual(small_variation.json()["linked_results"], [])
 
         poor_accuracy = self.client.post(
             f"/api/journeys/{journey['journey_id']}/locations",
@@ -567,8 +630,59 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0]["observation_type"], "route_deviation")
         self.assertEqual(observations[0]["consecutive_fixes"], 3)
+        linked = response.json()["linked_results"]
+        self.assertEqual(len(linked), 1)
+        assessment = linked[0]["assessment"]
+        event = linked[0]["event"]
+        gps_signal = next(
+            signal for signal in assessment["signals_used"] if signal["name"] == "gps"
+        )
+        self.assertEqual(assessment["risk_level"], "medium")
+        self.assertEqual(assessment["source"], "real")
+        self.assertFalse(assessment["is_demo"])
+        self.assertEqual(assessment["journey_id"], journey["journey_id"])
+        self.assertEqual(assessment["event_id"], event["id"])
+        self.assertEqual(gps_signal["source"], "real")
+        self.assertEqual(gps_signal["observed_at"], observations[0]["occurred_at"])
+        self.assertEqual(event["source"], "browser_geolocation")
+        self.assertFalse(event["is_demo"])
+        self.assertEqual(event["risk_assessment_id"], assessment["assessment_id"])
+
+        same_fix = {
+            "latitude": 0.01,
+            "longitude": 0.01,
+            "accuracy_meters": 10,
+            "speed_mps": 2,
+            "observed_at": (started_at + timedelta(seconds=50)).isoformat(),
+        }
+        retry = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations", json=same_fix
+        )
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertTrue(retry.json()["idempotent_retry"])
+        self.assertEqual(retry.json()["new_observations"], [])
+        self.assertEqual(
+            retry.json()["linked_results"][0]["assessment"]["assessment_id"],
+            assessment["assessment_id"],
+        )
+        self.assertEqual(
+            len(self.client.get("/api/risk/assessments").json()["assessments"]), 1
+        )
+        assessment_history = self.client.get("/api/risk/assessments").json()["assessments"]
+        self.assertEqual(assessment_history[0]["assessment_id"], assessment["assessment_id"])
+        escalation_history = self.client.get("/api/escalation/history").json()["history"]
+        self.assertEqual(len(escalation_history), 1)
+        self.assertEqual(escalation_history[0]["assessment_id"], assessment["assessment_id"])
+        self.assertEqual(
+            len(self.client.get("/api/events").json()["events"]), 1
+        )
+
         reloaded = self.client.get("/api/journeys/active").json()["journey"]
         self.assertEqual(reloaded["observations"][0]["id"], observations[0]["id"])
+        self.assertEqual(
+            reloaded["observations"][0]["risk_assessment_id"],
+            assessment["assessment_id"],
+        )
         tracking_state = main.journey_engine.repository.get_journey_tracking_state(
             journey["journey_id"]
         )
@@ -666,6 +780,70 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertIn(observations[0]["occurred_at"], accepted_times)
 
+    def test_location_retry_finishes_unlinked_observation_without_duplicates(self):
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=70)
+        journey = self.client.post(
+            "/api/journeys",
+            json={
+                "destination": "Destination",
+                "start_location": {
+                    "latitude": 0,
+                    "longitude": 0,
+                    "accuracy_meters": 8,
+                    "observed_at": started_at.isoformat(),
+                },
+                "planned_route": [
+                    {"latitude": 0, "longitude": 0},
+                    {"latitude": 0, "longitude": 0.02},
+                ],
+            },
+        ).json()
+        for second in (10, 20):
+            seeded = self.client.post(
+                f"/api/journeys/{journey['journey_id']}/locations",
+                json={
+                    "latitude": 0.01,
+                    "longitude": 0.01,
+                    "accuracy_meters": 10,
+                    "speed_mps": 2,
+                    "observed_at": (started_at + timedelta(seconds=second)).isoformat(),
+                },
+            )
+            self.assertEqual(seeded.status_code, 200, seeded.text)
+            self.assertEqual(seeded.json()["new_observations"], [])
+
+        fix = {
+            "latitude": 0.01,
+            "longitude": 0.01,
+            "accuracy_meters": 10,
+            "speed_mps": 2,
+            "observed_at": (started_at + timedelta(seconds=30)).isoformat(),
+        }
+        repository = main.journey_engine.repository
+        with patch.object(
+            repository,
+            "link_journey_observation",
+            side_effect=PersistenceError("temporary link failure"),
+        ):
+            failed = self.client.post(
+                f"/api/journeys/{journey['journey_id']}/locations", json=fix
+            )
+        self.assertEqual(failed.status_code, 503)
+
+        retried = self.client.post(
+            f"/api/journeys/{journey['journey_id']}/locations", json=fix
+        )
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertTrue(retried.json()["idempotent_retry"])
+        self.assertEqual(len(retried.json()["linked_results"]), 1)
+        self.assertEqual(len(self.client.get("/api/events").json()["events"]), 1)
+        self.assertEqual(
+            len(self.client.get("/api/risk/assessments").json()["assessments"]), 1
+        )
+        saved = repository.list_journey_observations(journey["journey_id"])[0]
+        self.assertIsNotNone(saved["risk_assessment_id"])
+        self.assertIsNotNone(saved["safety_event_id"])
+
     def test_gps_derived_stop_requires_threshold_duration_and_journey_can_end(self):
         main.event_engine.configure(
             MonitoringConfig(unexpected_stop_threshold_minutes=1)
@@ -709,6 +887,13 @@ class BackendApiTests(unittest.TestCase):
             last_response.json()["new_observations"][0]["expectedness"],
             "unknown",
         )
+        linked = last_response.json()["linked_results"]
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(linked[0]["assessment"]["risk_level"], "medium")
+        self.assertEqual(linked[0]["assessment"]["source"], "real")
+        self.assertEqual(linked[0]["event"]["event_type"], "unexpected_stop")
+        self.assertEqual(linked[0]["event"]["source"], "browser_geolocation")
+        self.assertIn("unknown", linked[0]["observation"]["expectedness"])
 
         ended = self.client.post(f"/api/journeys/{journey['journey_id']}/end")
         self.assertEqual(ended.status_code, 200, ended.text)
@@ -733,6 +918,32 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("a@example.org", str(listed))
         self.assertNotIn("+15551234567", str(listed))
 
+    def test_contact_can_be_updated_without_exposing_destination(self):
+        created = self.client.post(
+            "/api/contacts",
+            json={"name": "Trusted", "channel": "email", "destination": "old@example.org"},
+        ).json()["contact"]
+
+        response = self.client.put(
+            f"/api/contacts/{created['id']}",
+            json={"name": "Updated trusted", "channel": "sms", "destination": "+15551234567"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        updated = response.json()["contact"]
+        self.assertEqual(updated["id"], created["id"])
+        self.assertEqual(updated["name"], "Updated trusted")
+        self.assertEqual(updated["channel"], "sms")
+        self.assertEqual(updated["destination_hint"], "***4567")
+        self.assertNotIn("+15551234567", response.text)
+        self.assertEqual(self.client.get("/api/contacts").json()["contacts"], [updated])
+
+        missing = self.client.put(
+            "/api/contacts/not-a-contact",
+            json={"name": "Nobody", "channel": "email", "destination": "nobody@example.org"},
+        )
+        self.assertEqual(missing.status_code, 404)
+
     def test_risk_assessment_api_contract_and_missing_signals(self):
         response = self.client.post("/api/risk/assessments", json={"demo_mode": True})
 
@@ -753,6 +964,63 @@ class BackendApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_checkin_response_transitions_only_a_waiting_assessment(self):
+        assessment = self.client.post(
+            "/api/risk/assessments",
+            json={
+                "demo_mode": False,
+                "gps": {"source": "real", "deviation_meters": 800},
+                "check_in": {"source": "real", "responded": False, "overdue_minutes": 12},
+            },
+        ).json()
+        self.assertEqual(assessment["escalation_state"], "check_in_required")
+
+        response = self.client.post(
+            f"/api/risk/assessments/{assessment['assessment_id']}/check-in"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["escalation_state"], "monitoring")
+        self.assertEqual(response.json()["safety_assessment"], "UNKNOWN")
+        self.assertEqual(
+            self.client.get("/api/monitoring/state").json()["check_in_status"],
+            "passenger_responded",
+        )
+        self.assertEqual(
+            self.client.get("/api/risk/assessments/latest").json()["escalation_state"],
+            "monitoring",
+        )
+
+        repeated = self.client.post(
+            f"/api/risk/assessments/{assessment['assessment_id']}/check-in"
+        )
+        self.assertEqual(repeated.status_code, 409)
+
+    def test_latest_assessment_reports_its_own_escalation_state(self):
+        first = self.client.post(
+            "/api/risk/assessments",
+            json={
+                "demo_mode": False,
+                "gps": {"source": "real", "deviation_meters": 800},
+                "check_in": {"source": "real", "responded": False, "overdue_minutes": 12},
+            },
+        ).json()
+        second = self.client.post(
+            "/api/risk/assessments",
+            json={
+                "demo_mode": False,
+                "gps": {"source": "real", "deviation_meters": 800},
+                "vehicle": {"source": "real", "stopped_minutes": 6},
+            },
+        ).json()
+        self.assertEqual(second["escalation_state"], "check_in_required")
+        self.client.post(
+            f"/api/risk/assessments/{first['assessment_id']}/check-in"
+        )
+
+        latest = self.client.get("/api/risk/assessments/latest").json()
+        self.assertEqual(latest["assessment_id"], second["assessment_id"])
+        self.assertEqual(latest["escalation_state"], "check_in_required")
 
     def test_critical_scenario_uses_mock_escalation_and_incident_idempotency(self):
         main.risk_engine.escalation_enabled = True
@@ -777,6 +1045,16 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(processed.json()["state"], "notified")
         self.assertEqual(processed.json()["notification"]["provider"], "mock")
         self.assertIn("no person was contacted", processed.json()["notification"]["provider_response"]["message"])
+        same_assessment_retry = self.client.post(
+            "/api/escalation/process",
+            json={"assessment_id": first.json()["assessment_id"]},
+        )
+        self.assertEqual(same_assessment_retry.status_code, 200)
+        self.assertTrue(same_assessment_retry.json()["idempotent_replay"])
+        self.assertEqual(
+            same_assessment_retry.json()["notification"]["id"],
+            processed.json()["notification"]["id"],
+        )
         repeated = self.client.post(
             "/api/escalation/process",
             json={"assessment_id": second.json()["assessment_id"]},
@@ -843,11 +1121,19 @@ class BackendApiTests(unittest.TestCase):
 
 
 class EventEngineTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.engine = EventEngine(
+            SQLiteRepository(f"{self.temp_dir.name}/event-engine.db")
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
     def test_rule_rejects_route_signal_below_custom_threshold(self):
-        engine = EventEngine()
-        engine.configure(main.MonitoringConfig(route_deviation_threshold_meters=1000))
+        self.engine.configure(main.MonitoringConfig(route_deviation_threshold_meters=1000))
         with self.assertRaisesRegex(ValueError, "below"):
-            engine.create_demo_event(
+            self.engine.create_demo_event(
                 main.DemoEventRequest(
                     event_type="route_deviation", route_deviation_meters=999
                 )
